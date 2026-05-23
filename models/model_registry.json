@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "models": {
+    "easyocr_craft": {
+      "name": "CRAFT Text Detector",
+      "file": "easyocr/craft_mlt_25k.pth",
+      "size_mb": 79.3,
+      "source": "https://github.com/JaidedAI/EasyOCR",
+      "version": "1.0",
+      "license": "Apache-2.0",
+      "required": true,
+      "auto_download": false
+    },
+    "easyocr_zh_sim": {
+      "name": "Chinese Simplified Recognizer",
+      "file": "easyocr/zh_sim_g2.pth",
+      "size_mb": 20.9,
+      "source": "https://github.com/JaidedAI/EasyOCR",
+      "version": "1.0",
+      "license": "Apache-2.0",
+      "required": true,
+      "auto_download": false
+    }
+  },
+  "total_size_mb": 100.2,
+  "last_updated": "2026-05-23"
+}
