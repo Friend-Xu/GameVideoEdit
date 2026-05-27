@@ -62,8 +62,18 @@ desktop.ini
 # ============================================
 
 .claude/settings.local.json
+.claude/settings.json
 .claude/debug/
 .claude/memory/
+.claude.json
+.claude/workspace/
+
+# ============================================
+# 开发文档 (不提交)
+# ============================================
+
+*.txt
+!requirements.txt
 
 # ============================================
 # 日志
