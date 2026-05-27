@@ -158,9 +158,9 @@ def get_recognizer(recog_network, network_params, character,\
     num_class = len(converter.character)
 
     if recog_network == 'generation1':
-        model_pkg = importlib.import_module("EasyOCR_1_7_2.easyocr.model.model")
+        model_pkg = importlib.import_module("easyocr.model.model")
     elif recog_network == 'generation2':
-        model_pkg = importlib.import_module("EasyOCR_1_7_2.easyocr.model.vgg_model")
+        model_pkg = importlib.import_module("easyocr.model.vgg_model")
     else:
         model_pkg = importlib.import_module(recog_network)
     model = model_pkg.Model(num_class=num_class, **network_params)
