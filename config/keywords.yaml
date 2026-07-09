@@ -1,66 +1,59 @@
-# 和平精英击杀检测关键词配置
+# 和平精英击杀检测关键词配置（信号拆解格式）
 
-patterns:
-  # === 自己击杀 ===
-  - id: kill_self
-    regex: "你使用了(\\S+)淘汰了(\\S+)"
-    action: "击杀"
-    actor: "自己"
-    extract: [weapon, target]
-
-  - id: knockdown_self
-    regex: "你使用了(\\S+)击倒了(\\S+)"
-    action: "击倒"
-    actor: "自己"
-    extract: [weapon, target]
-
-  # === 队友击杀 ===
-  - id: kill_teammate
-    regex: "你的队友(\\S+)使用了(\\S+)淘汰了(\\S+)"
-    action: "击杀"
-    actor: "队友"
-    extract: [teammate, weapon, target]
-
-  - id: knockdown_teammate
-    regex: "你的队友(\\S+)使用了(\\S+)击倒了(\\S+)"
-    action: "击倒"
-    actor: "队友"
-    extract: [teammate, weapon, target]
-
-  # === 队友被击杀 ===
-  - id: teammate_killed_headshot
-    regex: "你的队友(\\S+)被(\\S+)使用(\\S+)命中头部击倒了"
-    action: "被爆头击倒"
-    actor: "敌人"
-    extract: [teammate, enemy, weapon]
-
-  - id: teammate_killed
-    regex: "你的队友(\\S+)被(\\S+)使用(\\S+)淘汰了"
-    action: "被击杀"
-    actor: "敌人"
-    extract: [teammate, enemy, weapon]
-
-  - id: teammate_knocked
-    regex: "你的队友(\\S+)被(\\S+)使用(\\S+)击倒了"
-    action: "被击倒"
-    actor: "敌人"
-    extract: [teammate, enemy, weapon]
-
-  # === 通用兜底 ===
-  - id: kill_generic
-    regex: ".*淘汰了(\\S+)"
-    action: "击杀"
-    actor: "未知"
-    extract: [target]
-
-  - id: knockdown_generic
-    regex: ".*击倒了(\\S+)"
-    action: "击倒"
-    actor: "未知"
-    extract: [target]
+# 全局描述词 — 游戏更新改这里即可
+descriptors:
+  - "精确打击"   # 新版本
+  - "爆头"       # 旧版本
+  - "命中头部"   # 旧版本变体
 
 # 触发前缀(OCR文本必须包含以下任一项才进入匹配)
 trigger_prefixes:
   - "你使用"
   - "你的队友"
   - "你被"
+
+rules:
+  # === 自己击杀 ===
+  - id: kill_self
+    actor: "自己"
+    actor_signal: "你使用"
+    action: "淘汰"
+
+  - id: knockdown_self
+    actor: "自己"
+    actor_signal: "你使用"
+    action: "击倒"
+
+  # === 队友被击杀（require_signal 优先级最高） ===
+  - id: teammate_killed_headshot
+    actor: "敌人"
+    actor_signal: "你的队友"
+    require_signal: "被"
+    action: "击倒"
+    descriptors_override: ["命中头部"]
+    require_descriptor: true
+
+  - id: teammate_killed
+    actor: "敌人"
+    actor_signal: "你的队友"
+    require_signal: "被"
+    action: "淘汰"
+
+  - id: teammate_knocked
+    actor: "敌人"
+    actor_signal: "你的队友"
+    require_signal: "被"
+    action: "击倒"
+
+  # === 队友击杀（anti_signal 排除"被"） ===
+  - id: kill_teammate
+    actor: "队友"
+    actor_signal: "你的队友"
+    anti_signal: "被"
+    action: "淘汰"
+
+  - id: knockdown_teammate
+    actor: "队友"
+    actor_signal: "你的队友"
+    anti_signal: "被"
+    action: "击倒"

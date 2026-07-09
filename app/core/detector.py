@@ -95,13 +95,20 @@ class DetectionEngine:
 
     def __init__(self, matcher: KeywordMatcher, detector: OCRDetector,
                  padding_before: float = 10.0, padding_after: float = 10.0,
-                 skip_frames: int = 3, merge_gap: float = 30.0):
+                 skip_frames: int = 3, merge_gap: float = 30.0,
+                 mode: str = "frame", interval_sec: float = 1.0,
+                 post_detect_skip_sec: float = 0.3,
+                 allowed_actors: set | None = None):
         self._matcher = matcher
         self._detector = detector
         self.padding_before = padding_before
         self.padding_after = padding_after
         self.skip_frames = skip_frames
         self.merge_gap = merge_gap
+        self.mode = mode
+        self.interval_sec = interval_sec
+        self.post_detect_skip_sec = post_detect_skip_sec
+        self.allowed_actors = allowed_actors
 
     def process_frame(self, frame: np.ndarray, rois: list,
                       fps: float, frame_number: int) -> FrameResult:
@@ -115,6 +122,8 @@ class DetectionEngine:
             for ocr_r in self._detector.detect(roi_img):
                 match = self._matcher.match(ocr_r.text)
                 if match:
+                    if self.allowed_actors is not None and match.actor not in self.allowed_actors:
+                        continue
                     frame_hits.append(ocr_r)
                     if frame_matched is None:
                         frame_matched = match

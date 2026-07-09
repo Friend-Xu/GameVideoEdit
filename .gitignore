@@ -74,6 +74,8 @@ desktop.ini
 
 *.txt
 !requirements.txt
+docs/
+assets/prompts/
 
 # ============================================
 # 日志

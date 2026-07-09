@@ -13,6 +13,10 @@ ocr:
   confidence_threshold: 0.5
 
 detection:
+  mode: "time"
+  skip_frames: 3
+  interval_sec: 1.0
+  post_detect_skip_sec: 0.3
   keyword_file: "keywords.yaml"
   padding_before: 10.0
   padding_after: 10.0

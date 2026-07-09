@@ -27,7 +27,10 @@ class OCRWorker(QThread):
                  annotation: AnnotationStore, matcher: KeywordMatcher,
                  gpu: bool = True, skip_frames: int = 3,
                  start_frame: int = 0, end_frame: int | None = None,
-                 padding_before: float = 10.0, padding_after: float = 10.0):
+                 padding_before: float = 10.0, padding_after: float = 10.0,
+                 mode: str = "frame", interval_sec: float = 1.0,
+                 post_detect_skip_sec: float = 0.3,
+                 allowed_actors: set | None = None):
         super().__init__()
         self.thread_id = thread_id
         self._video_path = video_path
@@ -39,6 +42,10 @@ class OCRWorker(QThread):
         self._end_frame = end_frame
         self._padding_before = padding_before
         self._padding_after = padding_after
+        self._mode = mode
+        self._interval_sec = interval_sec
+        self._post_detect_skip_sec = post_detect_skip_sec
+        self._allowed_actors = allowed_actors
         self._cancel_event = threading.Event()
 
     def run(self):
@@ -49,6 +56,10 @@ class OCRWorker(QThread):
                 padding_before=self._padding_before,
                 padding_after=self._padding_after,
                 skip_frames=self._skip_frames,
+                mode=self._mode,
+                interval_sec=self._interval_sec,
+                post_detect_skip_sec=self._post_detect_skip_sec,
+                allowed_actors=self._allowed_actors,
             )
             player = VideoPlayer()
             info = player.open(self._video_path)
@@ -62,28 +73,57 @@ class OCRWorker(QThread):
                 return
 
             detections: list[FrameResult] = []
-            fn = self._start_frame
 
-            while fn <= end and not self._cancel_event.is_set():
-                try:
-                    frame = player.seek(fn)
-                except Exception:
-                    fn += 1; continue
+            if self._mode == "time":
+                start_sec = self._start_frame / fps
+                end_sec = end / fps
+                current_time = start_sec
+                while current_time <= end_sec and not self._cancel_event.is_set():
+                    fn = int(current_time * fps)
+                    if fn > end:
+                        break
+                    try:
+                        frame = player.seek(fn)
+                    except Exception:
+                        current_time += self._interval_sec
+                        continue
 
-                result = engine.process_frame(frame, rois, fps, fn)
+                    result = engine.process_frame(frame, rois, fps, fn)
 
-                if result.detected:
-                    detections.append(result)
-                    text = result.match_result.raw_text if result.match_result else ""
-                    self.detected.emit(result.timestamp, text)
-                    self.log.emit(
-                        f"线程{self.thread_id}: [{result.timestamp:.1f}s] {text}", LOG_INFO)
-                    fn += max(1, int(fps * 0.3))
-                else:
-                    fn += self._skip_frames
+                    if result.detected:
+                        detections.append(result)
+                        text = result.match_result.raw_text if result.match_result else ""
+                        self.detected.emit(result.timestamp, text)
+                        self.log.emit(
+                            f"线程{self.thread_id}: [{result.timestamp:.1f}s] {text}", LOG_INFO)
+                        current_time += self._post_detect_skip_sec
+                    else:
+                        current_time += self._interval_sec
 
-                pct = (fn - self._start_frame) / (end - self._start_frame) * 100
-                self.progress.emit(self.thread_id, min(pct, 100.0))
+                    pct = (current_time - start_sec) / (end_sec - start_sec) * 100
+                    self.progress.emit(self.thread_id, min(pct, 100.0))
+            else:
+                fn = self._start_frame
+                while fn <= end and not self._cancel_event.is_set():
+                    try:
+                        frame = player.seek(fn)
+                    except Exception:
+                        fn += 1; continue
+
+                    result = engine.process_frame(frame, rois, fps, fn)
+
+                    if result.detected:
+                        detections.append(result)
+                        text = result.match_result.raw_text if result.match_result else ""
+                        self.detected.emit(result.timestamp, text)
+                        self.log.emit(
+                            f"线程{self.thread_id}: [{result.timestamp:.1f}s] {text}", LOG_INFO)
+                        fn += max(1, int(fps * self._post_detect_skip_sec))
+                    else:
+                        fn += self._skip_frames
+
+                    pct = (fn - self._start_frame) / (end - self._start_frame) * 100
+                    self.progress.emit(self.thread_id, min(pct, 100.0))
 
             player.close()
             time_ranges = engine._merge_detections(detections)

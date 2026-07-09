@@ -4,13 +4,13 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout,
-    QWidget, QDialog, QDialogButtonBox, QComboBox,
+    QWidget, QDialog, QDialogButtonBox, QComboBox, QDoubleSpinBox,
 )
 
 from app.core.annotator import AnnotationStore
@@ -91,7 +91,9 @@ class MainWindow(QMainWindow):
         vd = os.path.dirname(vp); vn = os.path.splitext(os.path.basename(vp))[0]
         auto = os.path.join(vd, f"{vn}_labels.json")
         dlg = OCRDialog(vp, auto if os.path.exists(auto) else "", self._player.rotation,
-                        self._matcher, self); dlg.exec()
+                        self._matcher, self)
+        dlg.export_requested.connect(self._on_ocr_export)
+        dlg.exec()
 
     def _start_export(self):
         vp = self._player.video_path
@@ -107,9 +109,14 @@ class MainWindow(QMainWindow):
             if kw.exists(): self._matcher = KeywordMatcher.from_yaml(str(kw))
         except Exception: pass
 
+    def _on_ocr_export(self, video_path: str, clip_ranges: list):
+        dlg = ExportDialog(video_path, clip_ranges=clip_ranges, parent=self)
+        dlg.exec()
+
 
 class OCRDialog(QDialog):
     """OCR 处理对话框"""
+    export_requested = Signal(str, list)  # (video_path, clip_ranges)
 
     def __init__(self, video_path: str, annotation_path: str, rotation: int = 0,
                  matcher: KeywordMatcher | None = None, parent=None):
@@ -134,12 +141,31 @@ class OCRDialog(QDialog):
         gl.addLayout(al); layout.addWidget(g1)
 
         # 参数
-        g2 = QGroupBox("参数"); pl = QHBoxLayout(g2)
+        g2 = QGroupBox("参数"); gv = QVBoxLayout(g2)
+        pl = QHBoxLayout()
         pl.addWidget(QLabel("预留时间(秒):")); self._padding = QSpinBox(); self._padding.setRange(1, 30); self._padding.setValue(10); pl.addWidget(self._padding)
         pl.addWidget(QLabel("线程数:")); self._threads_spin = QSpinBox(); self._threads_spin.setRange(1, 16); self._threads_spin.setValue(4); pl.addWidget(self._threads_spin)
         pl.addWidget(QLabel("旋转:")); self._rot_combo = QComboBox()
         self._rot_combo.addItems(["0°", "90°", "180°", "270°"]); self._rot_combo.setCurrentIndex({0: 0, 90: 1, 180: 2, 270: 3}.get(rotation, 0))
-        pl.addWidget(self._rot_combo); pl.addStretch(); layout.addWidget(g2)
+        pl.addWidget(self._rot_combo); pl.addStretch(); gv.addLayout(pl)
+        pl2 = QHBoxLayout()
+        pl2.addWidget(QLabel("OCR模式:"))
+        self._mode_combo = QComboBox(); self._mode_combo.addItems(["时间间隔", "帧间隔"])
+        self._mode_combo.currentIndexChanged.connect(self._on_ocr_mode_changed)
+        pl2.addWidget(self._mode_combo)
+        pl2.addWidget(QLabel("采样间隔:"))
+        self._interval_spin = QDoubleSpinBox(); self._interval_spin.setRange(0.1, 10.0)
+        self._interval_spin.setValue(1.0); self._interval_spin.setSingleStep(0.1); self._interval_spin.setDecimals(1)
+        pl2.addWidget(self._interval_spin); self._interval_unit = QLabel("秒"); pl2.addWidget(self._interval_unit)
+        self._skip_spin = QSpinBox(); self._skip_spin.setRange(1, 30); self._skip_spin.setValue(3)
+        self._skip_spin.setVisible(False); pl2.addWidget(self._skip_spin)
+        pl2.addWidget(QLabel("命中跳秒:")); self._post_detect = QDoubleSpinBox()
+        self._post_detect.setRange(0.1, 5.0); self._post_detect.setValue(0.3); self._post_detect.setSingleStep(0.1); self._post_detect.setDecimals(1)
+        pl2.addWidget(self._post_detect); pl2.addWidget(QLabel("秒"))
+        pl2.addWidget(QLabel("Actor过滤:"))
+        self._actor_combo = QComboBox(); self._actor_combo.addItems(["仅自己", "自己+队友击杀", "全部"])
+        pl2.addWidget(self._actor_combo); pl2.addStretch()
+        gv.addLayout(pl2); layout.addWidget(g2)
 
         # 进度
         self._status = QLabel("准备就绪..."); layout.addWidget(self._status)
@@ -160,7 +186,12 @@ class OCRDialog(QDialog):
         bl.addWidget(self._start_btn)
         btn_cancel = QPushButton("取消"); btn_cancel.clicked.connect(self._cancel); bl.addWidget(btn_cancel)
         self._save_btn = QPushButton("保存结果"); self._save_btn.clicked.connect(self._save); self._save_btn.setEnabled(False)
-        bl.addWidget(self._save_btn); layout.addLayout(bl)
+        bl.addWidget(self._save_btn)
+        self._export_btn = QPushButton("保存并导出"); self._export_btn.clicked.connect(self._save_and_export)
+        self._export_btn.setEnabled(False); self._export_btn.setStyleSheet(
+            "QPushButton { background-color: #FF5722; color: white; font-weight: bold; "
+            "border-radius: 5px; padding: 6px 14px; } QPushButton:hover { background-color: #E64A19; }")
+        bl.addWidget(self._export_btn); layout.addLayout(bl)
 
         # 自动加载
         if annotation_path and os.path.exists(annotation_path):
@@ -220,10 +251,18 @@ class OCRDialog(QDialog):
 
         for i in range(n_threads):
             sf = i * frames_per; ef = (i + 1) * frames_per - 1 if i < n_threads - 1 else total - 1
+            is_time_mode = self._mode_combo.currentIndex() == 0
+            actor_map = {0: {"自己"}, 1: {"自己", "队友"}, 2: None}
+            allowed_actors = actor_map.get(self._actor_combo.currentIndex(), None)
             worker = OCRWorker(i, self._video_path, self._annotation, self._matcher,
-                               gpu=True, skip_frames=3, start_frame=sf, end_frame=ef,
+                               gpu=True, skip_frames=self._skip_spin.value(),
+                               start_frame=sf, end_frame=ef,
                                padding_before=self._padding.value(),
-                               padding_after=self._padding.value())
+                               padding_after=self._padding.value(),
+                               mode="time" if is_time_mode else "frame",
+                               interval_sec=self._interval_spin.value(),
+                               post_detect_skip_sec=self._post_detect.value(),
+                               allowed_actors=allowed_actors)
             worker.log.connect(self._log_sys)
             worker.detected.connect(lambda ts, txt: self._log_ocr(f"[{int(ts//60):02d}:{int(ts%60):02d}] {txt}"))
             worker.finished.connect(self._on_thread_done)
@@ -245,6 +284,7 @@ class OCRDialog(QDialog):
     def _show_results(self):
         self._status.setText(f"完成! {len(self._time_ranges)} 个高光片段")
         self._start_btn.setEnabled(True); self._save_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
         self._progress.setValue(100)
         for i, tr in enumerate(self._time_ranges):
             sm, ss = int(tr.start_sec // 60), int(tr.start_sec % 60)
@@ -263,9 +303,26 @@ class OCRDialog(QDialog):
             with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
             QMessageBox.information(self, "保存成功", f"已保存 {len(self._time_ranges)} 个片段")
 
+    def _save_and_export(self):
+        if not self._time_ranges: QMessageBox.warning(self, "警告", "没有可导出的结果"); return
+        # 先自动保存
+        vd = os.path.dirname(self._video_path); vn = os.path.splitext(os.path.basename(self._video_path))[0]
+        clips_path = os.path.join(vd, f"{vn}_clips.json")
+        data = {"video_path": self._video_path, "clip_ranges": [[r.start_sec, r.end_sec] for r in self._time_ranges]}
+        with open(clips_path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+        self._log_sys(f"已自动保存: {clips_path}")
+        self.export_requested.emit(self._video_path, self._time_ranges)
+        self.accept()
+
     def _cancel(self):
         for w in self._ocr_threads: w.cancel()
         self._status.setText("已取消")
+
+    def _on_ocr_mode_changed(self, index):
+        is_time = index == 0
+        self._interval_spin.setVisible(is_time)
+        self._interval_unit.setVisible(is_time)
+        self._skip_spin.setVisible(not is_time)
 
     def _log_sys(self, msg: str, level: int = 0):
         self._sys_log.append(msg)
@@ -279,12 +336,13 @@ class OCRDialog(QDialog):
 class ExportDialog(QDialog):
     """视频导出对话框"""
 
-    def __init__(self, video_path: str, clips_path: str = "", parent=None):
+    def __init__(self, video_path: str, clips_path: str = "", parent=None,
+                 clip_ranges: list[TimeRange] | None = None):
         super().__init__(parent)
         self.setWindowTitle("导出剪辑"); self.setMinimumSize(800, 600)
         self._video_path = video_path
         self._clips_path = clips_path
-        self._clip_ranges: list[TimeRange] = []
+        self._clip_ranges: list[TimeRange] = list(clip_ranges) if clip_ranges else []
         self._output_path = ""
         self._worker: ExportWorker | None = None
 
@@ -314,7 +372,10 @@ class ExportDialog(QDialog):
         layout.addLayout(bl)
 
         self._set_default_output()
-        if clips_path and os.path.exists(clips_path): self._load_clips_file(clips_path)
+        if self._clip_ranges:
+            self._update_clips_label()
+        elif clips_path and os.path.exists(clips_path):
+            self._load_clips_file(clips_path)
 
     def _set_default_output(self):
         if not self._video_path: return
@@ -337,9 +398,13 @@ class ExportDialog(QDialog):
         try:
             with open(path, "r", encoding="utf-8") as f: data = json.load(f)
             self._clip_ranges = [TimeRange(s, e) for s, e in data.get("clip_ranges", [])]
-            self._clips_path = path; self._clips_label.setText(f"片段: {len(self._clip_ranges)} 个")
+            self._clips_path = path
+            self._update_clips_label()
             self._log_msg(f"已加载: {len(self._clip_ranges)} 个片段")
         except Exception as e: QMessageBox.critical(self, "错误", str(e))
+
+    def _update_clips_label(self):
+        self._clips_label.setText(f"片段: {len(self._clip_ranges)} 个")
 
     def _start_export(self):
         if not self._output_path: QMessageBox.warning(self, "错误", "请选择输出路径"); return
