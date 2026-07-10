@@ -3,7 +3,7 @@
 > 和平精英 / PUBG 游戏精彩击杀自动剪辑工具
 > Auto highlight clipping for PUBG / Peace Elite gameplay
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![PySide6](https://img.shields.io/badge/GUI-PySide6-green.svg)](https://pypi.org/project/PySide6/)
 
@@ -125,4 +125,4 @@ Edit `config/default.yaml` / 编辑 `config/default.yaml`:
 
 ## License | 许可
 
-MIT © [Friend-Xu](https://github.com/Friend-Xu)
+GPL v3 © [Friend-Xu](https://github.com/Friend-Xu)
