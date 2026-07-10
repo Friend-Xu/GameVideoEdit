@@ -24,7 +24,8 @@ A desktop application that detects kill events in gameplay videos via OCR and ex
 | ROI Annotation / 区域标注 | multi-label boxes, YOLO-format export / 多标签框选、YOLO格式 |
 | OCR Detection / 文字识别 | EasyOCR + GPU acceleration, multi-threaded / GPU加速、多线程 |
 | Smart Export / 智能导出 | FFmpeg + NVENC/AMF/QSV hardware encode / GPU硬件编码 |
-| PCL2-style UI / PCL2界面 | light/dark themes, dockable log viewer / 双主题、日志窗口 |
+
+![screenshot](GUI截图.png)
 
 ## Architecture | 架构
 
