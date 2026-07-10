@@ -48,6 +48,7 @@ app/
 │   ├── video_player # Player widget / 播放器
 │   └── overlay      # Annotation overlay / 标注层
 └── workers/       # QThread workers / 后台线程
+cli.py           # CLI tool / 命令行工具
 ```
 
 ## Quick Start | 快速开始
@@ -73,6 +74,42 @@ python app/main.py
 
 **Workflow / 使用流程:**
 1. Open video / 打开视频 → 2. Draw ROIs / 框选击杀提示区 → 3. Save labels / 保存标注 → 4. OCR detect / OCR识别 → 5. Export / 导出集锦
+
+## CLI Usage | 命令行
+
+无需 GUI 即可运行 OCR 检测和导出，适合批处理和 CI/CD 集成。
+
+```bash
+# 环境验证
+python cli.py verify
+
+# 查看视频信息
+python cli.py info video.mp4
+
+# 关键词匹配测试
+python cli.py match "你使用 M416 击倒了 玩家"
+python cli.py match -i                    # 交互式测试
+
+# OCR 检测 (使用 ROI 标注文件)
+python cli.py detect video.mp4 --roi video.roi.json -o results.json
+
+# OCR 检测 (手动指定 ROI 区域)
+python cli.py detect video.mp4 --roi-region 100,200,300,50 --mode time --interval 1.0
+
+# 过滤特定角色
+python cli.py detect video.mp4 --roi video.roi.json --actors 自己,队友
+
+# 导出视频片段
+python cli.py export video.mp4 results.json -o highlights.mp4
+```
+
+| 命令 | 说明 |
+|------|------|
+| `verify` | 验证运行环境 (Python, FFmpeg, GPU) |
+| `info` | 查看视频元信息、ROI 标注、已有检测结果 |
+| `match` | 测试关键词匹配规则 |
+| `detect` | 运行 OCR 检测，支持 time/frame 两种模式 |
+| `export` | 根据检测结果导出剪辑视频 |
 
 ## Configuration | 配置
 
