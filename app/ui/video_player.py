@@ -2,8 +2,9 @@
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QEvent, QPoint, QRect, QSize, QTimer, Signal
+from PySide6.QtCore import Qt, QEvent, QPoint, QRect, QSize, QTimer, QUrl, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSizePolicy,
     QSlider, QStyle, QStyleOptionSlider, QVBoxLayout, QWidget,
@@ -40,6 +41,9 @@ class VideoPlayerWidget(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self._player = CorePlayer()
+        self._audio_output = QAudioOutput()
+        self._audio_player = QMediaPlayer()
+        self._audio_player.setAudioOutput(self._audio_output)
         self._video_path: str | None = None
         self._rotation = 0
         self._current_frame_image: np.ndarray | None = None
@@ -149,21 +153,26 @@ class VideoPlayerWidget(QWidget):
             self._project.set_video(
                 path, info.width, info.height, info.fps, info.total_frames)
             self.refresh_regions()
+        # 加载音频 — QMediaPlayer 直接解码视频中的音频流，无需提取
+        self._audio_player.setSource(QUrl.fromLocalFile(path))
 
     def _toggle_play(self):
         if not self._player.is_open:
             return
         if self._timer.isActive():
             self._timer.stop()
+            self._audio_player.pause()
             self._play_btn.setText("播放")
         else:
             self._timer.start()
+            self._audio_player.play()
             self._play_btn.setText("暂停")
 
     def _on_timer(self):
         frame = self._player.next_frame_rgb()
         if frame is None:
             self._timer.stop()
+            self._audio_player.pause()
             self._play_btn.setText("播放")
             return
         self._display_frame(frame)
@@ -176,6 +185,8 @@ class VideoPlayerWidget(QWidget):
         if not self._player.is_open or not self._player.video_info:
             return
         self._timer.stop()
+        self._audio_player.pause()
+        self._audio_player.setPosition(int(second * 1000))
         self._play_btn.setText("播放")
         target = int(second * self._player.video_info.fps)
         try:
@@ -184,11 +195,14 @@ class VideoPlayerWidget(QWidget):
             pass
 
     def _set_position(self, pos: int):
-        if not self._player.is_open:
+        if not self._player.is_open or not self._player.video_info:
             return
         self._timer.stop()
+        self._audio_player.pause()
         self._play_btn.setText("播放")
         target = int(pos / 100.0 * self._player.video_info.total_frames)
+        second = target / self._player.video_info.fps
+        self._audio_player.setPosition(int(second * 1000))
         try:
             self._display_frame(self._player.seek_rgb(target))
         except Exception:
@@ -196,6 +210,7 @@ class VideoPlayerWidget(QWidget):
 
     def _prev_frame(self):
         self._timer.stop()
+        self._audio_player.pause()
         self._play_btn.setText("播放")
         if self._player.is_open:
             try:
@@ -206,6 +221,7 @@ class VideoPlayerWidget(QWidget):
 
     def _next_frame(self):
         self._timer.stop()
+        self._audio_player.pause()
         self._play_btn.setText("播放")
         f = self._player.next_frame_rgb()
         if f is not None:

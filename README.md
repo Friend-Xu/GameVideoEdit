@@ -18,7 +18,9 @@ A desktop application that detects kill events in gameplay videos via OCR and ex
 
 | | |
 |---|---|
-| Video Player / 视频播放器 | frame-by-frame, rotation, drag-and-drop / 逐帧、旋转、拖拽 |
+| Video Player / 视频播放器 | frame-by-frame, rotation, drag-and-drop, audio playback / 逐帧、旋转、拖拽、音频播放 |
+| Keyboard Shortcuts / 快捷键 | Space: play/pause, ←→: prev/next frame / 空格: 播放暂停, 方向键: 逐帧 |
+| Smart Seek / 智能跳转 | double-click clip → jump 1.5s before trigger / 双击片段精准跳转 |
 | ROI Annotation / 区域标注 | multi-label boxes, YOLO-format export / 多标签框选、YOLO格式 |
 | OCR Detection / 文字识别 | EasyOCR + GPU acceleration, multi-threaded / GPU加速、多线程 |
 | Smart Export / 智能导出 | FFmpeg + NVENC/AMF/QSV hardware encode / GPU硬件编码 |
