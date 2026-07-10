@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
 
         self._side_panel = SidePanelWidget()
         self._side_panel.set_project(self._project)
-        self._side_panel.setMinimumWidth(280)
+        self._side_panel.setMinimumWidth(340)
         splitter.addWidget(self._side_panel)
 
         self._player = VideoPlayerWidget()
@@ -129,7 +129,7 @@ class MainWindow(QMainWindow):
         btn_path = QPushButton("另存为")
         btn_path.clicked.connect(self._choose_export_path); pline.addWidget(btn_path)
         rl.addLayout(pline)
-        splitter.addWidget(right); splitter.setSizes([280, 700, 320])
+        splitter.addWidget(right); splitter.setSizes([340, 640, 320])
         for i in range(3):
             splitter.setCollapsible(i, False)
         ml.addWidget(splitter, 1)
