@@ -1,39 +1,35 @@
-# GameVideoEdit 默认配置
-# 用户可通过 %APPDATA%/GameVideoEdit/user_config.yaml 覆盖
-
 app:
-  name: "GameVideoEdit"
-  version: "2.0.0"
-  language: "zh_CN"
-
+  name: GameVideoEdit
+  version: 2.0.0
+  language: zh_CN
 ocr:
-  engine: "easyocr"
+  engine: easyocr
   gpu: true
-  languages: ["ch_sim", "en"]
+  languages:
+  - ch_sim
+  - en
   confidence_threshold: 0.5
-
 detection:
-  mode: "time"
-  skip_frames: 3
+  mode: time
   interval_sec: 1.0
+  skip_frames: 3
   post_detect_skip_sec: 0.3
-  keyword_file: "keywords.yaml"
-  padding_before: 10.0
-  padding_after: 10.0
-  merge_overlap: true
-  max_gap_seconds: 30.0
-
+  padding_before: 5
+  padding_after: 5
+  merge_gap: 30.0
+  num_threads: 4
+  rotation: 0
 export:
-  ffmpeg_path: "ffmpeg"
-  default_encoder: "auto"
-  output_format: "mp4"
+  ffmpeg_path: ffmpeg
+  default_encoder: auto
+  output_format: mp4
   quality: 23
-
 ui:
-  theme: "light"
-  language: "zh_CN"
-  default_window_size: [1200, 800]
-
+  theme: light
+  language: zh_CN
+  default_window_size:
+  - 1200
+  - 800
 advanced:
   scene_detection: false
   audio_analysis: false

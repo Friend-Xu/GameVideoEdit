@@ -60,14 +60,14 @@ desktop.ini
 # ============================================
 # Claude Code (保留计划文件)
 # ============================================
-
+.claude
 .claude/settings.local.json
 .claude/settings.json
 .claude/debug/
 .claude/memory/
 .claude.json
 .claude/workspace/
-
+.claude/plans
 # ============================================
 # 开发文档 (不提交)
 # ============================================

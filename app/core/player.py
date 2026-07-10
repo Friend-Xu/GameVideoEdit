@@ -95,6 +95,24 @@ class VideoPlayer:
         self._current_frame = frame
         return img
 
+    def seek_rgb(self, frame: int) -> np.ndarray:
+        """跳转到指定帧，返回 RGB 图像（播放专用，免去 BGR 转换）"""
+        if not self._is_open:
+            raise RuntimeError("未打开视频")
+        frame = max(0, min(frame, self._info.total_frames - 1))
+
+        if self._use_decord:
+            img = self._decord_reader[frame].asnumpy()
+            self._current_frame = frame
+            return img  # decord 原生返回 RGB
+
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        ret, img = self._cap.read()
+        if not ret:
+            raise RuntimeError(f"跳转到帧 {frame} 失败")
+        self._current_frame = frame
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
     def seek_time(self, seconds: float) -> np.ndarray:
         if not self._is_open:
             raise RuntimeError("未打开视频")
@@ -107,7 +125,28 @@ class VideoPlayer:
         nf = self._current_frame + 1
         if nf >= self._info.total_frames:
             return None
-        return self.seek(nf)
+        if self._use_decord:
+            return self.seek(nf)
+        ret, img = self._cap.read()
+        if not ret:
+            return None
+        self._current_frame = nf
+        return img
+
+    def next_frame_rgb(self) -> np.ndarray | None:
+        """下一帧 RGB（播放专用）"""
+        if not self._is_open:
+            raise RuntimeError("未打开视频")
+        nf = self._current_frame + 1
+        if nf >= self._info.total_frames:
+            return None
+        if self._use_decord:
+            return self.seek_rgb(nf)
+        ret, img = self._cap.read()
+        if not ret:
+            return None
+        self._current_frame = nf
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def close(self):
         if self._cap is not None:

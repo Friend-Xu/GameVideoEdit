@@ -105,6 +105,21 @@ class AnnotationStore:
                 return True
         return False
 
+    def clear_regions(self):
+        self._data.regions.clear()
+
+    def replace_regions(self, regions: list[dict]):
+        self._data.regions.clear()
+        for r in regions:
+            region = Region(
+                id=r.get("id", 0), label=r.get("label", ""),
+                center_x=r.get("center_x", 0.0), center_y=r.get("center_y", 0.0),
+                width=r.get("width", 0.0), height=r.get("height", 0.0),
+            )
+            self._data.regions.append(region)
+        if self._data.regions:
+            self._next_id = max(r.id for r in self._data.regions) + 1
+
     def to_pixel_rois(self, img_w: int, img_h: int) -> list[PixelROI]:
         rois: list[PixelROI] = []
         for r in self._data.regions:

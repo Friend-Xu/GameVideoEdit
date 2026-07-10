@@ -5,9 +5,8 @@ import threading
 from PySide6.QtCore import QThread, Signal
 
 from app.core.annotator import AnnotationStore
-from app.core.detector import DetectionEngine, FrameResult, OCRDetector
+from app.core.detector import DetectionEngine, OCRDetector
 from app.core.keywords import KeywordMatcher
-from app.core.player import VideoPlayer
 
 
 LOG_INFO = 0; LOG_WARNING = 1; LOG_ERROR = 2
@@ -61,74 +60,29 @@ class OCRWorker(QThread):
                 post_detect_skip_sec=self._post_detect_skip_sec,
                 allowed_actors=self._allowed_actors,
             )
-            player = VideoPlayer()
-            info = player.open(self._video_path)
-            fps, total = info.fps, info.total_frames
-            end = self._end_frame or (total - 1)
-            rois = self._annotation.to_pixel_rois(info.width, info.height)
+            tid = self.thread_id
 
-            if not rois:
-                self.finished.emit(self.thread_id, [])
-                player.close()
-                return
+            def on_progress(pct: float):
+                self.progress.emit(tid, pct)
 
-            detections: list[FrameResult] = []
+            def on_detected(timestamp: float, text: str):
+                self.detected.emit(timestamp, text)
+                self.log.emit(
+                    f"线程{tid}: [{timestamp:.1f}s] {text}", LOG_INFO)
 
-            if self._mode == "time":
-                start_sec = self._start_frame / fps
-                end_sec = end / fps
-                current_time = start_sec
-                while current_time <= end_sec and not self._cancel_event.is_set():
-                    fn = int(current_time * fps)
-                    if fn > end:
-                        break
-                    try:
-                        frame = player.seek(fn)
-                    except Exception:
-                        current_time += self._interval_sec
-                        continue
-
-                    result = engine.process_frame(frame, rois, fps, fn)
-
-                    if result.detected:
-                        detections.append(result)
-                        text = result.match_result.raw_text if result.match_result else ""
-                        self.detected.emit(result.timestamp, text)
-                        self.log.emit(
-                            f"线程{self.thread_id}: [{result.timestamp:.1f}s] {text}", LOG_INFO)
-                        current_time += self._post_detect_skip_sec
-                    else:
-                        current_time += self._interval_sec
-
-                    pct = (current_time - start_sec) / (end_sec - start_sec) * 100
-                    self.progress.emit(self.thread_id, min(pct, 100.0))
-            else:
-                fn = self._start_frame
-                while fn <= end and not self._cancel_event.is_set():
-                    try:
-                        frame = player.seek(fn)
-                    except Exception:
-                        fn += 1; continue
-
-                    result = engine.process_frame(frame, rois, fps, fn)
-
-                    if result.detected:
-                        detections.append(result)
-                        text = result.match_result.raw_text if result.match_result else ""
-                        self.detected.emit(result.timestamp, text)
-                        self.log.emit(
-                            f"线程{self.thread_id}: [{result.timestamp:.1f}s] {text}", LOG_INFO)
-                        fn += max(1, int(fps * self._post_detect_skip_sec))
-                    else:
-                        fn += self._skip_frames
-
-                    pct = (fn - self._start_frame) / (end - self._start_frame) * 100
-                    self.progress.emit(self.thread_id, min(pct, 100.0))
-
-            player.close()
-            time_ranges = engine._merge_detections(detections)
-            self.finished.emit(self.thread_id,
-                               [(r.start_sec, r.end_sec) for r in time_ranges])
+            time_ranges = engine.run_full(
+                video_path=self._video_path,
+                annotations=self._annotation,
+                start_frame=self._start_frame,
+                end_frame=self._end_frame,
+                progress_cb=on_progress,
+                detected_cb=on_detected,
+                cancel_check=self._cancel_event.is_set,
+            )
+            self.finished.emit(tid, [
+                (r.start_sec, r.end_sec, r.action, r.actor, r.pattern_id)
+                for r in time_ranges
+            ])
         except Exception as e:
             self.error.emit(str(e))
             self.finished.emit(self.thread_id, [])

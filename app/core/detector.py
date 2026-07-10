@@ -45,6 +45,15 @@ class TimeRange:
 
 
 @dataclass
+class DetectionResult(TimeRange):
+    """带元数据的检测结果"""
+    action: str = ""
+    actor: str = ""
+    pattern_id: str = ""
+    match_count: int = 1
+
+
+@dataclass
 class DetectionReport:
     video_path: str
     total_frames: int
@@ -133,22 +142,137 @@ class DetectionEngine:
             ocr_results=frame_hits, match_result=frame_matched,
         )
 
-    def _merge_detections(self, detections: list[FrameResult]) -> list[TimeRange]:
+    def run_full(self, video_path: str, annotations, start_frame: int = 0,
+                 end_frame: int | None = None,
+                 progress_cb=None, detected_cb=None, cancel_check=None
+                 ) -> list[TimeRange]:
+        """完整检测管线 — GUI 线程和 CLI 共用。
+
+        Args:
+            video_path: 视频文件路径
+            annotations: AnnotationStore 实例
+            start_frame: 起始帧号
+            end_frame: 结束帧号，None=视频末尾
+            progress_cb: 进度回调 (pct: float) -> None
+            detected_cb: 检测回调 (timestamp: float, text: str) -> None
+            cancel_check: 取消检查 () -> bool
+
+        Returns:
+            list[TimeRange] 合并后的时间段
+        """
+        from app.core.player import VideoPlayer
+
+        player = VideoPlayer()
+        info = player.open(video_path)
+        fps = info.fps
+        end = end_frame if end_frame is not None else (info.total_frames - 1)
+        rois = annotations.to_pixel_rois(info.width, info.height)
+
+        if not rois:
+            player.close()
+            return []
+
+        detections: list[FrameResult] = []
+
+        if self.mode == "time":
+            start_sec = start_frame / fps
+            end_sec = end / fps
+            current_time = start_sec
+            while current_time <= end_sec and not (cancel_check and cancel_check()):
+                fn = int(current_time * fps)
+                if fn > end:
+                    break
+                try:
+                    frame = player.seek(fn)
+                except Exception:
+                    current_time += self.interval_sec
+                    continue
+
+                result = self.process_frame(frame, rois, fps, fn)
+
+                if result.detected:
+                    detections.append(result)
+                    if detected_cb:
+                        detected_cb(result.timestamp,
+                                    result.match_result.raw_text if result.match_result else "")
+                    current_time += self.post_detect_skip_sec
+                else:
+                    current_time += self.interval_sec
+
+                if progress_cb:
+                    pct = (current_time - start_sec) / (end_sec - start_sec) * 100
+                    progress_cb(min(pct, 100.0))
+        else:
+            fn = start_frame
+            while fn <= end and not (cancel_check and cancel_check()):
+                try:
+                    frame = player.seek(fn)
+                except Exception:
+                    fn += 1
+                    continue
+
+                result = self.process_frame(frame, rois, fps, fn)
+
+                if result.detected:
+                    detections.append(result)
+                    if detected_cb:
+                        detected_cb(result.timestamp,
+                                    result.match_result.raw_text if result.match_result else "")
+                    fn += max(1, int(fps * self.post_detect_skip_sec))
+                else:
+                    fn += self.skip_frames
+
+                if progress_cb:
+                    pct = (fn - start_frame) / (end - start_frame) * 100
+                    progress_cb(min(pct, 100.0))
+
+        player.close()
+        return self._merge_detections(detections)
+
+    @staticmethod
+    def _best_meta(detections: list[FrameResult]) -> tuple[str, str, str]:
+        """从一组检测帧中选出最佳元数据：优先淘汰 > 击倒，取最高频次"""
+        score: dict[str, tuple[int, str, str, str]] = {}  # key → (count, action, actor, id)
+        for d in detections:
+            if d.match_result is None:
+                continue
+            action = d.match_result.action
+            key = f"{d.match_result.actor}|{action}"
+            if key not in score:
+                score[key] = (0, action, d.match_result.actor, d.match_result.pattern_id)
+            score[key] = (score[key][0] + 1, score[key][1], score[key][2], score[key][3])
+        priority_order = ["淘汰", "击倒"]
+        best = sorted(score.values(), key=lambda x: (
+            0 if x[1] in priority_order else 99 - priority_order.index(x[1]) if x[1] in priority_order else 0,
+            x[0]
+        ), reverse=True)
+        if best:
+            return best[0][1], best[0][2], best[0][3]  # action, actor, pattern_id
+        return "", "", ""
+
+    def _merge_detections(self, detections: list[FrameResult]) -> list[DetectionResult]:
         if not detections:
             return []
-        ranges = [TimeRange(
-            max(0.0, d.timestamp - self.padding_before),
-            d.timestamp + self.padding_after,
-        ) for d in detections]
-        ranges.sort(key=lambda r: r.start_sec)
-        merged = [ranges[0]]
-        for r in ranges[1:]:
-            last = merged[-1]
-            if r.start_sec - last.end_sec <= self.merge_gap:
-                merged[-1] = TimeRange(last.start_sec, max(last.end_sec, r.end_sec))
+        # 每帧分组合并
+        groups: list[list[FrameResult]] = []
+        sorted_d = sorted(detections, key=lambda d: d.timestamp)
+        groups.append([sorted_d[0]])
+        for d in sorted_d[1:]:
+            last = groups[-1][-1]
+            if d.timestamp - last.timestamp <= self.padding_before + self.padding_after + self.merge_gap:
+                groups[-1].append(d)
             else:
-                merged.append(r)
-        return merged
+                groups.append([d])
+        results: list[DetectionResult] = []
+        for g in groups:
+            action, actor, pid = self._best_meta(g)
+            results.append(DetectionResult(
+                start_sec=max(0.0, g[0].timestamp - self.padding_before),
+                end_sec=g[-1].timestamp + self.padding_after,
+                action=action, actor=actor, pattern_id=pid,
+                match_count=len(g),
+            ))
+        return results
 
     @staticmethod
     def merge_time_ranges(ranges: list[TimeRange], max_gap: float = 30.0) -> list[TimeRange]:

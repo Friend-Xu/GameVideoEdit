@@ -1,0 +1,15 @@
+{
+  "default": "ipad",
+  "templates": {
+    "ipad": [
+      {
+        "id": 1,
+        "label": "击杀提示",
+        "center_x": 0.492708,
+        "center_y": 0.82084,
+        "width": 0.514583,
+        "height": 0.046477
+      }
+    ]
+  }
+}

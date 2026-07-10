@@ -6,10 +6,12 @@ Project 是所有工作流状态的单一数据源，贯穿 打开视频 → 标
 
 import json
 import os
+from datetime import datetime
 from dataclasses import dataclass, field
 
 from app.core.annotator import AnnotationStore
 from app.core.exporter import ExportConfig
+from app.core.roi_templates import ROITemplateManager
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +156,7 @@ class Project:
         self.export = ExportConfig()
         self._undo_stack = UndoStack()
         self._dirty = False
+        self.last_detection: str = ""
 
     # ---- 视频 ----
 
@@ -170,6 +173,7 @@ class Project:
         self.export.output_path = os.path.join(
             self.source.dirname, f"{self.source.basename}_highlights.mp4")
         self._auto_load_roi()
+        self._auto_load_project()
 
     # ---- ROI 自动管理 ----
 
@@ -180,11 +184,66 @@ class Project:
         return os.path.join(self.source.dirname,
                             f"{self.source.basename}.roi.json")
 
+    @property
+    def project_path(self) -> str:
+        if not self.source.path:
+            return ""
+        return os.path.join(self.source.dirname,
+                            f"{self.source.basename}.project.json")
+
     def _auto_load_roi(self):
         path = self.roi_path
         if path and os.path.exists(path):
             try:
                 self.annotations = AnnotationStore.load_json(path)
+                return
+            except Exception:
+                pass
+        tmpl = ROITemplateManager().get_default()
+        if tmpl and tmpl.regions:
+            self.annotations.replace_regions(tmpl.regions)
+            self.auto_save_roi()
+
+    def _auto_load_project(self):
+        path = self.project_path
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                src = data.get("source", {})
+                if src.get("path") == self.source.path:
+                    self.results.clear()
+                    for r in data.get("results", []):
+                        self.results.append(ClipResult(
+                            start_sec=r["start_sec"], end_sec=r["end_sec"],
+                            pattern_id=r.get("pattern_id", ""),
+                            action=r.get("action", ""), actor=r.get("actor", ""),
+                            raw_text=r.get("raw_text", ""),
+                        ))
+                    self.last_detection = data.get("last_detection", "")
+                    det = data.get("detection", {})
+                    if det:
+                        cfg = self.detection
+                        for k in ("mode", "interval_sec", "skip_frames",
+                                   "post_detect_skip_sec", "padding_before",
+                                   "padding_after", "merge_gap", "num_threads"):
+                            if k in det:
+                                setattr(cfg, k, det[k])
+                    exp = data.get("export", {})
+                    if exp:
+                        for k in ("output_path", "quality", "preset", "use_gpu"):
+                            if k in exp:
+                                setattr(self.export, k, exp[k])
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def auto_save(self):
+        path = self.project_path
+        if path and self.results:
+            try:
+                self.save_json(path)
             except Exception:
                 pass
 
@@ -201,10 +260,10 @@ class Project:
         def do(): self.results.clear(); self.results.extend(items)
         def undo(): self.results.clear(); self.results.extend(old)
 
-        self.results.clear()
-        self.results.extend(items)
+        do()
         self._undo_stack.push(_ResultAction("设置识别结果", do, undo))
         self._dirty = True
+        self.auto_save()
 
     def remove_result(self, index: int) -> ClipResult | None:
         if index < 0 or index >= len(self.results):
@@ -265,6 +324,8 @@ class Project:
 
     def to_dict(self) -> dict:
         return {
+            "version": "2.0",
+            "last_detection": datetime.now().isoformat(),
             "source": {
                 "path": self.source.path,
                 "width": self.source.width,
@@ -317,6 +378,7 @@ class Project:
                 src["path"], src.get("width", 0), src.get("height", 0),
                 src.get("fps", 30.0), src.get("total_frames", 0),
             )
+            proj.results.clear()
         det = data.get("detection", {})
         if det:
             cfg = proj.detection
@@ -337,6 +399,7 @@ class Project:
             for k in ("output_path", "quality", "preset", "use_gpu"):
                 if k in exp:
                     setattr(proj.export, k, exp[k])
+        proj.last_detection = data.get("last_detection", "")
         proj._dirty = False
         return proj
 

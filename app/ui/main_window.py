@@ -4,21 +4,21 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QEvent, Qt, QSettings, QTimer
+from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import (
-    QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout,
-    QWidget, QDialog, QDialogButtonBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter,
+    QTextEdit, QVBoxLayout, QWidget, QComboBox, QDoubleSpinBox,
 )
 
-from app.core.annotator import AnnotationStore
-from app.core.detector import TimeRange, DetectionEngine, OCRDetector
-from app.core.exporter import ExportConfig, VideoExporter
+from app.core.detector import TimeRange, DetectionEngine
+from app.core.exporter import ExportConfig
 from app.core.keywords import KeywordMatcher
+from app.core.project import Project, ClipResult
 from app.ui.video_player import VideoPlayerWidget
-from app.workers.ocr_worker import OCRWorker, LOG_INFO, LOG_WARNING, LOG_ERROR
+from app.ui.side_panel import SidePanelWidget
+from app.workers.ocr_worker import OCRWorker
 from app.workers.export_worker import ExportWorker
 
 
@@ -30,36 +30,203 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("药药的剪辑工具"); self.resize(1200, 800)
         self._dark = False
         self._matcher: KeywordMatcher | None = None
+        self._project = Project()
         self._ocr_threads: list[OCRWorker] = []
         self._thread_results: dict[int, list] = {}
-        self._completed_threads = 0
+        self._completed = 0
+        self._ocr_detecting = False
+        self._detect_hit_count = 0
+        self._worker: ExportWorker | None = None
         self._setup_ui(); self._apply_theme()
+        QApplication.instance().installEventFilter(self)
         QTimer.singleShot(100, self._load_matcher)
 
     def _setup_ui(self):
         central = QWidget(); self.setCentralWidget(central)
         ml = QVBoxLayout(central); ml.setContentsMargins(10, 10, 10, 10); ml.setSpacing(8)
+
+        # ---- 顶部工具栏 ----
         tl = QHBoxLayout()
+        btn_open = QPushButton("打开视频"); btn_open.setProperty("cssClass", "primary")
+        btn_open.clicked.connect(self._open_video); tl.addWidget(btn_open)
         title = QLabel("药药的剪辑工具"); title.setObjectName("titleLabel")
         tl.addWidget(title); tl.addStretch()
+        self._params_btn = QPushButton("识别参数 ▾"); self._params_btn.clicked.connect(self._toggle_params)
+        tl.addWidget(self._params_btn)
+        self._detect_btn = QPushButton("开始识别"); self._detect_btn.setStyleSheet(
+            "QPushButton { background-color: #9C27B0; color: white; font-weight: bold; "
+            "border-radius: 5px; padding: 8px 18px; } QPushButton:hover { background-color: #7B1FA2; }"
+            "QPushButton:disabled { background-color: #666; }")
+        self._detect_btn.clicked.connect(self._on_detect_btn)
+        self._detect_btn.setEnabled(False); tl.addWidget(self._detect_btn)
         self._theme_btn = QPushButton("深色模式"); self._theme_btn.setProperty("cssClass", "primary")
         self._theme_btn.clicked.connect(self._toggle_theme); tl.addWidget(self._theme_btn)
         ml.addLayout(tl)
-        self._player = VideoPlayerWidget(); ml.addWidget(self._player, 1)
-        bl = QHBoxLayout(); bl.setSpacing(10)
-        btn_open = QPushButton("打开视频"); btn_open.setProperty("cssClass", "primary")
-        btn_open.clicked.connect(self._open_video); bl.addWidget(btn_open)
-        btn_save = QPushButton("保存标注"); btn_save.setProperty("cssClass", "success")
-        btn_save.clicked.connect(self._save_annotations); bl.addWidget(btn_save)
-        btn_ocr = QPushButton("OCR识别"); btn_ocr.setStyleSheet(
-            "QPushButton { background-color: #9C27B0; color: white; font-weight: bold; "
-            "border-radius: 5px; padding: 8px 18px; } QPushButton:hover { background-color: #7B1FA2; }")
-        btn_ocr.clicked.connect(self._start_ocr); bl.addWidget(btn_ocr)
-        btn_export = QPushButton("导出剪辑"); btn_export.setStyleSheet(
+
+        # ---- 可折叠参数面板（弹出浮层） ----
+        self._params_panel = self._create_params_panel()
+        self._params_panel.setVisible(False)
+
+        # ---- 中央分栏 ----
+        splitter = QSplitter(Qt.Horizontal)
+
+        self._side_panel = SidePanelWidget()
+        self._side_panel.set_project(self._project)
+        self._side_panel.setMinimumWidth(280)
+        splitter.addWidget(self._side_panel)
+
+        self._player = VideoPlayerWidget()
+        self._player.set_project(self._project)
+        self._player.setMinimumWidth(320)
+        self._player.frame_changed.connect(self._on_frame_changed)
+        splitter.addWidget(self._player)
+
+        # 右侧: 结果画廊 + 导出
+        right = QWidget(); right.setMinimumWidth(300)
+        rl = QVBoxLayout(right); rl.setContentsMargins(5, 5, 5, 5); rl.setSpacing(8)
+        self._result_label = QLabel("识别结果"); self._result_label.setFixedHeight(22)
+        rl.addWidget(self._result_label)
+        self._filter_bar = self._build_filter_bar()
+        self._filter_bar.setVisible(False); rl.addWidget(self._filter_bar)
+        self._progress_widget = self._build_progress_widget()
+        rl.addWidget(self._progress_widget)
+        self._progress_widget.setVisible(False)
+        self._result_list = QListWidget()
+        self._result_list.itemDoubleClicked.connect(self._on_result_double_clicked)
+        self._result_list.itemChanged.connect(lambda: self._update_export_buttons())
+        rl.addWidget(self._result_list, 1)
+
+        # undo / redo
+        ul = QHBoxLayout()
+        self._undo_btn = QPushButton("↩ 撤销"); self._undo_btn.clicked.connect(self._undo_result)
+        self._undo_btn.setEnabled(False); ul.addWidget(self._undo_btn)
+        self._redo_btn = QPushButton("↪ 重做"); self._redo_btn.clicked.connect(self._redo_result)
+        self._redo_btn.setEnabled(False); ul.addWidget(self._redo_btn)
+        ul.addStretch()
+        rl.addLayout(ul)
+
+        # 导出按钮
+        el = QHBoxLayout()
+        self._export_selected_btn = QPushButton("导出选中(0)"); self._export_selected_btn.setStyleSheet(
             "QPushButton { background-color: #FF5722; color: white; font-weight: bold; "
-            "border-radius: 5px; padding: 8px 18px; } QPushButton:hover { background-color: #E64A19; }")
-        btn_export.clicked.connect(self._start_export); bl.addWidget(btn_export)
-        ml.addLayout(bl); self.statusBar().showMessage("就绪")
+            "border-radius: 5px; padding: 8px 18px; } QPushButton:hover { background-color: #E64A19; }"
+            "QPushButton:disabled { background-color: #666; color: #CCC; }")
+        self._export_selected_btn.clicked.connect(lambda: self._start_export(selected_only=True))
+        self._export_selected_btn.setEnabled(False); el.addWidget(self._export_selected_btn)
+        self._export_all_btn = QPushButton("导出全部(0)"); self._export_all_btn.setStyleSheet(
+            "QPushButton { background-color: #FF5722; color: white; font-weight: bold; "
+            "border-radius: 5px; padding: 8px 18px; } QPushButton:hover { background-color: #E64A19; }"
+            "QPushButton:disabled { background-color: #666; color: #CCC; }")
+        self._export_all_btn.clicked.connect(lambda: self._start_export(selected_only=False))
+        self._export_all_btn.setEnabled(False); el.addWidget(self._export_all_btn)
+        rl.addLayout(el)
+
+        pline = QHBoxLayout()
+        pline.addWidget(QLabel("输出:"))
+        self._export_path_label = QLabel("(未设置)")
+        self._export_path_label.setStyleSheet("color: #888;")
+        pline.addWidget(self._export_path_label, 1)
+        btn_path = QPushButton("另存为")
+        btn_path.clicked.connect(self._choose_export_path); pline.addWidget(btn_path)
+        rl.addLayout(pline)
+        splitter.addWidget(right); splitter.setSizes([280, 700, 320])
+        for i in range(3):
+            splitter.setCollapsible(i, False)
+        ml.addWidget(splitter, 1)
+        self.statusBar().showMessage("就绪")
+        self._wire_side_panel()
+
+    def _build_filter_bar(self) -> QWidget:
+        w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(4)
+        self._filter_btns: dict[str, QPushButton] = {}
+        self._filter_all_btn = QPushButton("全部"); self._filter_all_btn.setCheckable(True)
+        self._filter_all_btn.setChecked(True)
+        self._filter_all_btn.clicked.connect(lambda: self._filter_by_actor(None))
+        l.addWidget(self._filter_all_btn)
+        for actor in ["自己", "队友", "敌人"]:
+            btn = QPushButton(actor); btn.setCheckable(True)
+            btn.clicked.connect(lambda checked, a=actor: self._filter_by_actor(a))
+            self._filter_btns[actor] = btn; l.addWidget(btn)
+        l.addStretch()
+        return w
+
+    def _filter_by_actor(self, actor: str | None):
+        self._filter_all_btn.setChecked(actor is None)
+        for a, btn in self._filter_btns.items():
+            btn.setChecked(a == actor)
+        for i in range(self._result_list.count()):
+            item = self._result_list.item(i)
+            if actor is None:
+                item.setHidden(False)
+            else:
+                has_actor = actor in item.text()
+                item.setHidden(not has_actor)
+        self._update_export_buttons()
+
+    def _build_progress_widget(self) -> QWidget:
+        w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(6)
+        self._total_bar = QProgressBar(); self._total_bar.setRange(0, 100); self._total_bar.setFixedHeight(22)
+        l.addWidget(self._total_bar)
+        self._thread_bars: list[QProgressBar] = []
+        self._thread_container = QVBoxLayout(); l.addLayout(self._thread_container)
+        self._detect_count_label = QLabel("已检测到: 0")
+        self._detect_count_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self._detect_count_label.setFixedHeight(22)
+        self._detect_count_label.setWordWrap(True)
+        l.addWidget(self._detect_count_label)
+        l.addStretch()
+        return w
+
+    def _wire_side_panel(self):
+        sp = self._side_panel
+        vp = self._player
+
+        sp.regions_changed.connect(vp.refresh_regions)
+        sp.tag_selected.connect(vp.set_selected_region)
+        sp.label_colors_changed.connect(vp.set_label_colors)
+        sp.history_opened.connect(self._open_video_from_history)
+        sp.template_applied.connect(self._on_template_applied)
+
+        vp.regions_changed.connect(sp.refresh_tag_list)
+
+        vp.set_label_colors(sp.label_colors())
+        vp.set_current_label(sp.current_label)
+
+    def _on_template_applied(self, name: str):
+        from app.core.roi_templates import ROITemplateManager
+        tmpl = ROITemplateManager().get(name)
+        if tmpl and tmpl.regions:
+            self._project.annotations.replace_regions(tmpl.regions)
+            self._project.auto_save_roi()
+            self._player.refresh_regions()
+            self._side_panel.refresh_tag_list()
+
+    def _open_video_from_history(self, path: str):
+        if os.path.exists(path):
+            self._player.open_video_file(path)
+            self._detect_btn.setEnabled(True)
+            self._on_video_opened(path)
+
+    def _should_intercept_key(self) -> bool:
+        """文本输入控件有焦点时不拦截快捷键，避免干扰打字。"""
+        fw = self.focusWidget()
+        if fw is None:
+            return True
+        return not isinstance(fw, (QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit))
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Space, Qt.Key_Left, Qt.Key_Right):
+                if self._player._player.is_open and self._should_intercept_key():
+                    if key == Qt.Key_Space:
+                        self._player._toggle_play()
+                    elif key == Qt.Key_Left:
+                        self._player._prev_frame()
+                    elif key == Qt.Key_Right:
+                        self._player._next_frame()
+                    return True  # 消费事件，不传给焦点控件
+        return super().eventFilter(obj, event)
 
     def _toggle_theme(self):
         self._dark = not self._dark; self._apply_theme()
@@ -69,12 +236,372 @@ class MainWindow(QMainWindow):
         if qss_file.exists():
             with open(qss_file, "r", encoding="utf-8") as f: self.setStyleSheet(f.read())
         self._theme_btn.setText("浅色模式" if self._dark else "深色模式")
+        self._update_params_popup_style()
+
+    def _update_params_popup_style(self):
+        if self._dark:
+            self._params_panel.setStyleSheet(
+                "#paramsPopup { background: #2D2D2D; border: 2px solid #555; "
+                "border-radius: 8px; padding: 10px; } "
+                "#paramsPopup QLabel { color: #DDD; } "
+                "#paramsPopup QComboBox { background: #3D3D3D; color: #DDD; "
+                "border: 1px solid #555; border-radius: 3px; padding: 3px; } "
+                "#paramsPopup QSpinBox, #paramsPopup QDoubleSpinBox { "
+                "background: #3D3D3D; color: #DDD; border: 1px solid #555; "
+                "border-radius: 3px; padding: 3px; }")
+        else:
+            self._params_panel.setStyleSheet(
+                "#paramsPopup { background: #FFFFFF; border: 2px solid #3a7ca5; "
+                "border-radius: 8px; padding: 10px; }")
+
+    # ---- 参数面板 ----
+
+    def _load_detection_defaults(self) -> dict:
+        import yaml
+        from app.utils.paths import config_dir
+        yaml_path = config_dir() / "default.yaml"
+        if yaml_path.exists():
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                return cfg.get("detection", {})
+            except Exception:
+                pass
+        return {}
+
+    def _create_params_panel(self) -> QWidget:
+        d = self._load_detection_defaults()
+
+        # 直接设置 Project 默认值
+        det = self._project.detection
+        det.mode = d.get("mode", "time")
+        det.interval_sec = float(d.get("interval_sec", 1.0))
+        det.skip_frames = int(d.get("skip_frames", 3))
+        det.post_detect_skip_sec = float(d.get("post_detect_skip_sec", 0.3))
+        det.padding_before = float(d.get("padding_before", 10.0))
+        det.padding_after = float(d.get("padding_after", 10.0))
+        det.merge_gap = float(d.get("merge_gap", 30.0))
+        det.num_threads = int(d.get("num_threads", 4))
+        det.rotation = int(d.get("rotation", 0))
+
+        w = QWidget()
+        w.setWindowFlags(Qt.Popup)
+        w.setObjectName("paramsPopup")
+        gv = QVBoxLayout(w); gv.setContentsMargins(10, 10, 10, 10)
+
+        pl = QHBoxLayout()
+        pl.addWidget(QLabel("预留时间(秒):"))
+        self._padding = QSpinBox(); self._padding.setRange(1, 30); self._padding.setValue(int(det.padding_before))
+        self._padding.valueChanged.connect(
+            lambda v: setattr(self._project.detection, 'padding_before', v) or
+            setattr(self._project.detection, 'padding_after', v))
+        pl.addWidget(self._padding)
+        pl.addWidget(QLabel("线程数:"))
+        self._threads_spin = QSpinBox(); self._threads_spin.setRange(1, 16)
+        self._threads_spin.setValue(det.num_threads)
+        self._threads_spin.valueChanged.connect(
+            lambda v: setattr(self._project.detection, 'num_threads', v))
+        pl.addWidget(self._threads_spin)
+        pl.addWidget(QLabel("旋转:"))
+        self._rot_combo = QComboBox()
+        self._rot_combo.addItems(["0°", "90°", "180°", "270°"])
+        self._rot_combo.setCurrentIndex(det.rotation // 90)
+        self._rot_combo.currentIndexChanged.connect(
+            lambda i: setattr(self._project.detection, 'rotation', i * 90))
+        pl.addWidget(self._rot_combo); pl.addStretch(); gv.addLayout(pl)
+
+        pl2 = QHBoxLayout()
+        pl2.addWidget(QLabel("OCR模式:"))
+        is_time = det.mode == "time"
+        self._mode_combo = QComboBox(); self._mode_combo.addItems(["时间间隔", "帧间隔"])
+        self._mode_combo.setCurrentIndex(0 if is_time else 1)
+        self._mode_combo.currentIndexChanged.connect(self._on_ocr_mode_changed)
+        pl2.addWidget(self._mode_combo)
+        pl2.addWidget(QLabel("采样间隔:"))
+        self._interval_spin = QDoubleSpinBox(); self._interval_spin.setRange(0.1, 10.0)
+        self._interval_spin.setValue(det.interval_sec)
+        self._interval_spin.setSingleStep(0.1); self._interval_spin.setDecimals(1)
+        self._interval_spin.valueChanged.connect(
+            lambda v: setattr(self._project.detection, 'interval_sec', v))
+        pl2.addWidget(self._interval_spin); self._interval_unit = QLabel("秒"); pl2.addWidget(self._interval_unit)
+        self._skip_spin = QSpinBox(); self._skip_spin.setRange(1, 30)
+        self._skip_spin.setValue(det.skip_frames)
+        self._skip_spin.setVisible(not is_time)
+        self._skip_spin.valueChanged.connect(
+            lambda v: setattr(self._project.detection, 'skip_frames', v))
+        pl2.addWidget(self._skip_spin)
+        pl2.addWidget(QLabel("命中跳秒:"))
+        self._post_detect = QDoubleSpinBox()
+        self._post_detect.setRange(0.1, 5.0)
+        self._post_detect.setValue(det.post_detect_skip_sec)
+        self._post_detect.setSingleStep(0.1); self._post_detect.setDecimals(1)
+        self._post_detect.valueChanged.connect(
+            lambda v: setattr(self._project.detection, 'post_detect_skip_sec', v))
+        pl2.addWidget(self._post_detect); pl2.addWidget(QLabel("秒"))
+        pl2.addStretch()
+        gv.addLayout(pl2)
+
+        save_btn = QPushButton("保存为默认值")
+        save_btn.clicked.connect(self._save_detection_defaults)
+        gv.addWidget(save_btn)
+
+        return w
+
+    def _save_detection_defaults(self):
+        import yaml
+        from app.utils.paths import config_dir
+        yaml_path = config_dir() / "default.yaml"
+        cfg = {}
+        if yaml_path.exists():
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception:
+                pass
+        cfg["detection"] = {
+            "mode": self._project.detection.mode,
+            "interval_sec": self._project.detection.interval_sec,
+            "skip_frames": self._project.detection.skip_frames,
+            "post_detect_skip_sec": self._project.detection.post_detect_skip_sec,
+            "padding_before": self._project.detection.padding_before,
+            "padding_after": self._project.detection.padding_after,
+            "merge_gap": self._project.detection.merge_gap,
+            "num_threads": self._project.detection.num_threads,
+            "rotation": self._project.detection.rotation,
+        }
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        self.statusBar().showMessage("检测参数已保存为默认值", 3000)
+
+    def _toggle_params(self):
+        if self._params_panel.isVisible():
+            self._params_panel.hide()
+            self._params_btn.setText("识别参数 ▾")
+        else:
+            btn = self._params_btn
+            pos = btn.mapToGlobal(btn.rect().bottomLeft())
+            self._params_panel.move(pos)
+            self._params_panel.show()
+            self._params_btn.setText("识别参数 ▴")
+
+    def _on_ocr_mode_changed(self, index):
+        is_time = index == 0
+        self._project.detection.mode = "time" if is_time else "frame"
+        self._interval_spin.setVisible(is_time)
+        self._interval_unit.setVisible(is_time)
+        self._skip_spin.setVisible(not is_time)
+
+    # ---- OCR 识别 ----
+
+    def _on_detect_btn(self):
+        if self._ocr_detecting:
+            self._cancel_detection()
+        else:
+            self._start_detection()
+
+    def _start_detection(self):
+        if not self._project.source.path or not self._matcher:
+            return
+        self._ocr_detecting = True
+        self._detect_btn.setText("取消识别")
+        self._export_selected_btn.setEnabled(False)
+        self._export_all_btn.setEnabled(False)
+        self._result_list.clear(); self._thread_results.clear(); self._completed = 0
+        self._ocr_threads.clear()
+        self._detect_hit_count = 0
+        self._result_label.setText("识别进度")
+        self._progress_widget.setVisible(True)
+        self._total_bar.setValue(0)
+        self._detect_count_label.setText("已检测到: 0")
+        for b in self._thread_bars:
+            self._thread_container.removeWidget(b)
+            b.deleteLater()
+        self._thread_bars.clear()
+
+        from app.core.detector import OCRDetector
+        try:
+            detector = OCRDetector(gpu=True)
+            import numpy as np
+            detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
+        except Exception as e:
+            QMessageBox.critical(self, "模型加载失败", str(e))
+            self._reset_detect_state()
+            return
+
+        from app.core.player import VideoPlayer
+        player = VideoPlayer()
+        try:
+            info = player.open(self._project.source.path)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+            self._reset_detect_state()
+            return
+        finally:
+            player.close()
+
+        total = info.total_frames; n_threads = self._project.detection.num_threads
+        fps = info.fps; frames_per = total // n_threads
+
+        for i in range(n_threads):
+            sf = i * frames_per
+            ef = (i + 1) * frames_per - 1 if i < n_threads - 1 else total - 1
+            worker = OCRWorker(
+                i, self._project.source.path, self._project.annotations,
+                self._matcher, **self._project.detection.to_worker_kwargs(),
+                start_frame=sf, end_frame=ef,
+            )
+            worker.progress.connect(self._on_ocr_progress)
+            worker.detected.connect(self._on_ocr_detected)
+            worker.finished.connect(self._on_ocr_thread_done)
+            self._ocr_threads.append(worker)
+
+            bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0); bar.setFixedHeight(18)
+            bar.setFormat(f"线程 {i + 1}: %p%")
+            self._thread_bars.append(bar)
+            self._thread_container.addWidget(bar)
+
+        self.statusBar().showMessage(f"启动 {n_threads} 个识别线程...")
+        for w in self._ocr_threads:
+            w.start()
+
+    def _cancel_detection(self):
+        for w in self._ocr_threads:
+            w.cancel()
+        self._progress_widget.setVisible(False)
+        self._result_label.setText("识别结果")
+        self._ocr_detecting = False
+        self._detect_btn.setText("开始识别")
+        self.statusBar().showMessage("已取消识别")
+
+    def _reset_detect_state(self):
+        self._ocr_detecting = False
+        self._detect_btn.setText("开始识别")
+        self._detect_btn.setEnabled(True)
+
+    def _on_ocr_progress(self, tid: int, pct: float):
+        if tid < len(self._thread_bars):
+            self._thread_bars[tid].setValue(int(pct))
+        total_work = sum(b.value() for b in self._thread_bars)
+        total_count = len(self._thread_bars)
+        self._total_bar.setValue(total_work // total_count if total_count else 0)
+        done = sum(1 for _ in self._thread_results.values())
+        self.statusBar().showMessage(
+            f"识别中... {done}/{len(self._ocr_threads)} 个线程完成 | 发现 {self._detect_hit_count} 个片段")
+
+    def _on_ocr_detected(self, timestamp: float, text: str):
+        self._detect_hit_count += 1
+        short = text[:25] + "..." if len(text) > 25 else text
+        self._detect_count_label.setText(
+            f"已检测到: {self._detect_hit_count} | [{timestamp:.1f}s] {short}")
+
+    def _on_ocr_thread_done(self, tid: int, ranges: list):
+        self._thread_results[tid] = ranges; self._completed += 1
+        if tid < len(self._thread_bars):
+            self._thread_bars[tid].setValue(100)
+            self._thread_bars[tid].setFormat(f"线程 {tid + 1}: 完成")
+        if self._completed >= len(self._ocr_threads):
+            self._progress_widget.setVisible(False)
+            self._filter_bar.setVisible(True)
+            self._result_label.setText("识别结果")
+            self._ocr_detecting = False
+            self._detect_btn.setText("开始识别")
+            all_clips = []
+            for rl in self._thread_results.values():
+                for item in rl:
+                    s, e = item[0], item[1]
+                    action = item[2] if len(item) > 2 else ""
+                    actor = item[3] if len(item) > 3 else ""
+                    all_clips.append(ClipResult(
+                        start_sec=s, end_sec=e, action=action, actor=actor))
+            if all_clips:
+                all_clips.sort(key=lambda c: c.start_sec)
+                self._project.set_results(all_clips)
+            self._show_results()
+
+    def _show_results(self):
+        count = self._project.result_count
+        self.statusBar().showMessage(f"识别完成! {count} 个高光片段")
+        self._detect_btn.setEnabled(True)
+        self._result_list.clear()
+        actor_counts: dict[str, int] = {}
+        for i, r in enumerate(self._project.results):
+            sm, ss = int(r.start_sec // 60), int(r.start_sec % 60)
+            em, es = int(r.end_sec // 60), int(r.end_sec % 60)
+            tag = f"[{r.actor}·{r.action}]" if r.actor else ""
+            text = f"{tag} 片段 {i+1}: [{sm:02d}:{ss:02d} - {em:02d}:{es:02d}] 时长 {r.duration:.1f}秒"
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self._result_list.addItem(item)
+            if r.actor:
+                actor_counts[r.actor] = actor_counts.get(r.actor, 0) + 1
+        total = count
+        self._filter_all_btn.setText(f"全部({total})")
+        for actor, btn in self._filter_btns.items():
+            n = actor_counts.get(actor, 0)
+            btn.setText(f"{actor}({n})")
+        self._filter_all_btn.setChecked(True)
+        self._filter_bar.setVisible(total > 0)
+        self._update_export_buttons()
+        self._update_undo_redo_buttons()
+
+    def _on_result_double_clicked(self, item):
+        idx = self._result_list.row(item)
+        if 0 <= idx < len(self._project.results):
+            r = self._project.results[idx]
+            seek_to = max(0, r.start_sec + self._project.detection.padding_before - 1.5)
+            self._player.seek_to_second(seek_to)
+
+    # ---- 撤销/重做 ----
+
+    def _undo_result(self):
+        desc = self._project.undo()
+        if desc:
+            self.statusBar().showMessage(f"撤销: {desc}")
+            self._show_results()
+
+    def _redo_result(self):
+        desc = self._project.redo()
+        if desc:
+            self.statusBar().showMessage(f"重做: {desc}")
+            self._show_results()
+
+    def _update_undo_redo_buttons(self):
+        self._undo_btn.setEnabled(self._project.can_undo)
+        self._redo_btn.setEnabled(self._project.can_redo)
+
+    def _on_frame_changed(self, frame: int):
+        pass  # 预留给时间线组件
 
     def _open_video(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开视频", "", "视频文件 (*.mp4 *.avi *.mov *.mkv)")
-        if path: self._player.open_video_file(path)
+        settings = QSettings("GameVideoEdit", "PeaceEliteHighlights")
+        last_dir = settings.value("last_video_dir", "")
+        from app.utils.paths import videos_dir
+        default = str(last_dir) if last_dir else str(videos_dir())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开视频", default, "视频文件 (*.mp4 *.avi *.mov *.mkv)")
+        if path:
+            self._player.open_video_file(path)
+            self._detect_btn.setEnabled(True)
+            settings.setValue("last_video_dir", os.path.dirname(path))
+            self._on_video_opened(path)
+
+    def _on_video_opened(self, path: str):
+        self._side_panel.refresh_tag_list()
+        self._side_panel.add_history(path)
+        self._player.set_label_colors(self._side_panel.label_colors())
+        self._player.set_current_label(self._side_panel.current_label)
+        self.statusBar().showMessage(f"已打开: {os.path.basename(path)}")
+        if self._project.results:
+            self._show_results()
+            ts = self._project.last_detection[:19] if self._project.last_detection else ""
+            msg = f"已加载 {self._project.result_count} 个历史识别片段"
+            if ts:
+                msg += f" ({ts})"
+            self.statusBar().showMessage(msg)
 
     def _save_annotations(self):
+        """标注已自动保存到 .roi.json，此方法保留用于手动导出完整标注文件"""
         data = self._player.save_annotations()
         if not data: QMessageBox.warning(self, "警告", "没有可保存的标注区域"); return
         vp = data["video_path"]; bn = os.path.splitext(os.path.basename(vp))[0]
@@ -85,22 +612,66 @@ class MainWindow(QMainWindow):
             with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
             self.statusBar().showMessage(f"标注已保存: {path}")
 
-    def _start_ocr(self):
-        vp = self._player.video_path
-        if not vp: QMessageBox.warning(self, "提示", "请先打开视频"); return
-        vd = os.path.dirname(vp); vn = os.path.splitext(os.path.basename(vp))[0]
-        auto = os.path.join(vd, f"{vn}_labels.json")
-        dlg = OCRDialog(vp, auto if os.path.exists(auto) else "", self._player.rotation,
-                        self._matcher, self)
-        dlg.export_requested.connect(self._on_ocr_export)
-        dlg.exec()
+    def _start_export(self, selected_only: bool = False):
+        results = self._checked_results() if selected_only else [
+            self._project.results[i] for i in range(self._result_list.count())
+            if not self._result_list.item(i).isHidden() and i < len(self._project.results)
+        ]
+        if not results:
+            QMessageBox.warning(self, "提示", "没有可导出的片段"); return
+        config = ExportConfig(output_path=self._project.export.output_path)
+        self._export_selected_btn.setEnabled(False)
+        self._export_all_btn.setEnabled(False)
+        self._worker = ExportWorker(
+            self._project.source.path,
+            [TimeRange(r.start_sec, r.end_sec) for r in results],
+            config,
+        )
+        self._worker.progress.connect(
+            lambda p, m: self.statusBar().showMessage(f"导出: {m} ({p}%)"))
+        self._worker.finished.connect(self._on_export_done)
+        self._worker.start()
 
-    def _start_export(self):
-        vp = self._player.video_path
-        if not vp: QMessageBox.warning(self, "提示", "请先打开视频"); return
-        vd = os.path.dirname(vp); vn = os.path.splitext(os.path.basename(vp))[0]
-        auto = os.path.join(vd, f"{vn}_clips.json")
-        dlg = ExportDialog(vp, auto if os.path.exists(auto) else "", self); dlg.exec()
+    def _checked_results(self) -> list:
+        selected = []
+        for i in range(self._result_list.count()):
+            item = self._result_list.item(i)
+            if (not item.isHidden() and item.checkState() == Qt.Checked
+                    and i < len(self._project.results)):
+                selected.append(self._project.results[i])
+        return selected
+
+    def _on_export_done(self, success: bool, message: str):
+        self._update_export_buttons()
+        if success:
+            QMessageBox.information(self, "完成", message)
+        else:
+            QMessageBox.warning(self, "失败", message)
+
+    def _update_export_buttons(self):
+        total = self._project.result_count
+        visible = sum(1 for i in range(self._result_list.count())
+                      if not self._result_list.item(i).isHidden())
+        checked = sum(1 for i in range(self._result_list.count())
+                      if not self._result_list.item(i).isHidden()
+                      and self._result_list.item(i).checkState() == Qt.Checked)
+        has_results = total > 0
+        self._export_selected_btn.setText(f"导出选中({checked})")
+        self._export_selected_btn.setEnabled(has_results and checked > 0)
+        self._export_all_btn.setText(f"导出全部({visible})")
+        self._export_all_btn.setEnabled(has_results and visible > 0)
+        self._export_path_label.setText(
+            os.path.basename(self._project.export.output_path)
+            if self._project.export.output_path else "(未设置)")
+
+    def _choose_export_path(self):
+        default = self._project.export.output_path or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出路径", default,
+            "MP4视频 (*.mp4);;AVI视频 (*.avi);;MKV视频 (*.mkv)")
+        if path:
+            self._project.export.output_path = path
+            self._update_export_buttons()
 
     def _load_matcher(self):
         try:
@@ -108,324 +679,3 @@ class MainWindow(QMainWindow):
             kw = config_dir() / "keywords.yaml"
             if kw.exists(): self._matcher = KeywordMatcher.from_yaml(str(kw))
         except Exception: pass
-
-    def _on_ocr_export(self, video_path: str, clip_ranges: list):
-        dlg = ExportDialog(video_path, clip_ranges=clip_ranges, parent=self)
-        dlg.exec()
-
-
-class OCRDialog(QDialog):
-    """OCR 处理对话框"""
-    export_requested = Signal(str, list)  # (video_path, clip_ranges)
-
-    def __init__(self, video_path: str, annotation_path: str, rotation: int = 0,
-                 matcher: KeywordMatcher | None = None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("OCR处理"); self.setMinimumSize(900, 700)
-        self._video_path = video_path
-        self._annotation_path = annotation_path
-        self._rotation = rotation
-        self._matcher = matcher
-        self._annotation: AnnotationStore | None = None
-        self._time_ranges: list[TimeRange] = []
-        self._ocr_threads: list[OCRWorker] = []
-        self._thread_results: dict[int, list] = {}
-        self._completed = 0
-
-        layout = QVBoxLayout(self)
-        # 标注文件选择
-        g1 = QGroupBox("标注文件"); gl = QVBoxLayout(g1)
-        al = QHBoxLayout(); al.addWidget(QLabel("路径:"))
-        self._anno_edit = QLineEdit(); self._anno_edit.setReadOnly(True); al.addWidget(self._anno_edit)
-        btn_browse = QPushButton("浏览..."); btn_browse.clicked.connect(self._browse_anno); al.addWidget(btn_browse)
-        gl.addLayout(al); layout.addWidget(g1)
-
-        # 参数
-        g2 = QGroupBox("参数"); gv = QVBoxLayout(g2)
-        pl = QHBoxLayout()
-        pl.addWidget(QLabel("预留时间(秒):")); self._padding = QSpinBox(); self._padding.setRange(1, 30); self._padding.setValue(10); pl.addWidget(self._padding)
-        pl.addWidget(QLabel("线程数:")); self._threads_spin = QSpinBox(); self._threads_spin.setRange(1, 16); self._threads_spin.setValue(4); pl.addWidget(self._threads_spin)
-        pl.addWidget(QLabel("旋转:")); self._rot_combo = QComboBox()
-        self._rot_combo.addItems(["0°", "90°", "180°", "270°"]); self._rot_combo.setCurrentIndex({0: 0, 90: 1, 180: 2, 270: 3}.get(rotation, 0))
-        pl.addWidget(self._rot_combo); pl.addStretch(); gv.addLayout(pl)
-        pl2 = QHBoxLayout()
-        pl2.addWidget(QLabel("OCR模式:"))
-        self._mode_combo = QComboBox(); self._mode_combo.addItems(["时间间隔", "帧间隔"])
-        self._mode_combo.currentIndexChanged.connect(self._on_ocr_mode_changed)
-        pl2.addWidget(self._mode_combo)
-        pl2.addWidget(QLabel("采样间隔:"))
-        self._interval_spin = QDoubleSpinBox(); self._interval_spin.setRange(0.1, 10.0)
-        self._interval_spin.setValue(1.0); self._interval_spin.setSingleStep(0.1); self._interval_spin.setDecimals(1)
-        pl2.addWidget(self._interval_spin); self._interval_unit = QLabel("秒"); pl2.addWidget(self._interval_unit)
-        self._skip_spin = QSpinBox(); self._skip_spin.setRange(1, 30); self._skip_spin.setValue(3)
-        self._skip_spin.setVisible(False); pl2.addWidget(self._skip_spin)
-        pl2.addWidget(QLabel("命中跳秒:")); self._post_detect = QDoubleSpinBox()
-        self._post_detect.setRange(0.1, 5.0); self._post_detect.setValue(0.3); self._post_detect.setSingleStep(0.1); self._post_detect.setDecimals(1)
-        pl2.addWidget(self._post_detect); pl2.addWidget(QLabel("秒"))
-        pl2.addWidget(QLabel("Actor过滤:"))
-        self._actor_combo = QComboBox(); self._actor_combo.addItems(["仅自己", "自己+队友击杀", "全部"])
-        pl2.addWidget(self._actor_combo); pl2.addStretch()
-        gv.addLayout(pl2); layout.addWidget(g2)
-
-        # 进度
-        self._status = QLabel("准备就绪..."); layout.addWidget(self._status)
-        self._progress = QProgressBar(); layout.addWidget(self._progress)
-
-        # 日志+结果
-        splitter = QSplitter(Qt.Horizontal)
-        self._ocr_log = QTextEdit(); self._ocr_log.setReadOnly(True); splitter.addWidget(self._ocr_log)
-        self._sys_log = QTextEdit(); self._sys_log.setReadOnly(True); splitter.addWidget(self._sys_log)
-        layout.addWidget(splitter, 1)
-
-        # 结果列表
-        self._result_list = QListWidget(); layout.addWidget(self._result_list)
-
-        # 按钮
-        bl = QHBoxLayout()
-        self._start_btn = QPushButton("开始处理"); self._start_btn.clicked.connect(self._start); self._start_btn.setEnabled(False)
-        bl.addWidget(self._start_btn)
-        btn_cancel = QPushButton("取消"); btn_cancel.clicked.connect(self._cancel); bl.addWidget(btn_cancel)
-        self._save_btn = QPushButton("保存结果"); self._save_btn.clicked.connect(self._save); self._save_btn.setEnabled(False)
-        bl.addWidget(self._save_btn)
-        self._export_btn = QPushButton("保存并导出"); self._export_btn.clicked.connect(self._save_and_export)
-        self._export_btn.setEnabled(False); self._export_btn.setStyleSheet(
-            "QPushButton { background-color: #FF5722; color: white; font-weight: bold; "
-            "border-radius: 5px; padding: 6px 14px; } QPushButton:hover { background-color: #E64A19; }")
-        bl.addWidget(self._export_btn); layout.addLayout(bl)
-
-        # 自动加载
-        if annotation_path and os.path.exists(annotation_path):
-            self._load_annotation(annotation_path)
-
-    def _browse_anno(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择标注文件", "", "JSON文件 (*.json)")
-        if path: self._load_annotation(path)
-
-    def _load_annotation(self, path: str):
-        try:
-            self._annotation = AnnotationStore.load_json(path)
-            self._annotation_path = path; self._anno_edit.setText(path)
-            self._video_path = self._annotation.video_path
-            self._start_btn.setEnabled(True)
-            self._log_sys(f"已加载标注: {path}, {self._annotation.region_count} 个区域")
-        except Exception as e:
-            QMessageBox.critical(self, "加载失败", str(e))
-
-    def _start(self):
-        if not self._annotation or not self._matcher: return
-        self._start_btn.setEnabled(False); self._save_btn.setEnabled(False)
-        self._result_list.clear(); self._ocr_log.clear(); self._sys_log.clear()
-        self._thread_results.clear(); self._completed = 0
-
-        # 预加载模型 (避免在线程中首次加载阻塞)
-        self._status.setText("正在加载OCR模型...")
-        self._log_sys("加载 EasyOCR 模型中...")
-        from app.core.detector import OCRDetector
-        try:
-            detector = OCRDetector(gpu=True)
-            # 预热: 跑一次空推理确保模型加载到GPU
-            import numpy as np
-            detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
-        except Exception as e:
-            QMessageBox.critical(self, "模型加载失败", str(e))
-            self._start_btn.setEnabled(True)
-            return
-
-        # 验证GPU
-        import torch
-        if torch.cuda.is_available():
-            mem = torch.cuda.memory_allocated() / (1024**3)
-            self._log_sys(f"GPU 显存已分配: {mem:.2f} GB")
-        self._status.setText("模型加载完成, 正在启动处理...")
-
-        from app.core.player import VideoPlayer
-        player = VideoPlayer()
-        try: info = player.open(self._video_path)
-        except Exception as e: QMessageBox.critical(self, "错误", str(e)); return
-        finally: player.close()
-
-        total = info.total_frames; n_threads = self._threads_spin.value()
-        fps = info.fps
-        frames_per = total // n_threads
-        self._ocr_threads.clear()
-
-        for i in range(n_threads):
-            sf = i * frames_per; ef = (i + 1) * frames_per - 1 if i < n_threads - 1 else total - 1
-            is_time_mode = self._mode_combo.currentIndex() == 0
-            actor_map = {0: {"自己"}, 1: {"自己", "队友"}, 2: None}
-            allowed_actors = actor_map.get(self._actor_combo.currentIndex(), None)
-            worker = OCRWorker(i, self._video_path, self._annotation, self._matcher,
-                               gpu=True, skip_frames=self._skip_spin.value(),
-                               start_frame=sf, end_frame=ef,
-                               padding_before=self._padding.value(),
-                               padding_after=self._padding.value(),
-                               mode="time" if is_time_mode else "frame",
-                               interval_sec=self._interval_spin.value(),
-                               post_detect_skip_sec=self._post_detect.value(),
-                               allowed_actors=allowed_actors)
-            worker.log.connect(self._log_sys)
-            worker.detected.connect(lambda ts, txt: self._log_ocr(f"[{int(ts//60):02d}:{int(ts%60):02d}] {txt}"))
-            worker.finished.connect(self._on_thread_done)
-            self._ocr_threads.append(worker)
-
-        self._status.setText(f"启动 {n_threads} 个线程...")
-        for w in self._ocr_threads: w.start()
-
-    def _on_thread_done(self, tid: int, ranges: list):
-        self._thread_results[tid] = ranges; self._completed += 1
-        self._log_sys(f"线程 {tid} 完成: {len(ranges)} 个片段")
-        if self._completed >= len(self._ocr_threads):
-            all_ranges = []
-            for rl in self._thread_results.values():
-                for s, e in rl: all_ranges.append(TimeRange(s, e))
-            self._time_ranges = DetectionEngine.merge_time_ranges(all_ranges)
-            self._show_results()
-
-    def _show_results(self):
-        self._status.setText(f"完成! {len(self._time_ranges)} 个高光片段")
-        self._start_btn.setEnabled(True); self._save_btn.setEnabled(True)
-        self._export_btn.setEnabled(True)
-        self._progress.setValue(100)
-        for i, tr in enumerate(self._time_ranges):
-            sm, ss = int(tr.start_sec // 60), int(tr.start_sec % 60)
-            em, es = int(tr.end_sec // 60), int(tr.end_sec % 60)
-            self._result_list.addItem(
-                f"片段 {i+1}: [{sm:02d}:{ss:02d} - {em:02d}:{es:02d}] 时长 {tr.duration:.1f}秒")
-
-    def _save(self):
-        if not self._time_ranges: QMessageBox.warning(self, "警告", "没有可保存的结果"); return
-        vd = os.path.dirname(self._video_path); vn = os.path.splitext(os.path.basename(self._video_path))[0]
-        default = os.path.join(vd, f"{vn}_clips.json")
-        path, _ = QFileDialog.getSaveFileName(self, "保存结果", default, "JSON文件 (*.json)")
-        if path:
-            if not path.endswith(".json"): path += ".json"
-            data = {"video_path": self._video_path, "clip_ranges": [[r.start_sec, r.end_sec] for r in self._time_ranges]}
-            with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-            QMessageBox.information(self, "保存成功", f"已保存 {len(self._time_ranges)} 个片段")
-
-    def _save_and_export(self):
-        if not self._time_ranges: QMessageBox.warning(self, "警告", "没有可导出的结果"); return
-        # 先自动保存
-        vd = os.path.dirname(self._video_path); vn = os.path.splitext(os.path.basename(self._video_path))[0]
-        clips_path = os.path.join(vd, f"{vn}_clips.json")
-        data = {"video_path": self._video_path, "clip_ranges": [[r.start_sec, r.end_sec] for r in self._time_ranges]}
-        with open(clips_path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-        self._log_sys(f"已自动保存: {clips_path}")
-        self.export_requested.emit(self._video_path, self._time_ranges)
-        self.accept()
-
-    def _cancel(self):
-        for w in self._ocr_threads: w.cancel()
-        self._status.setText("已取消")
-
-    def _on_ocr_mode_changed(self, index):
-        is_time = index == 0
-        self._interval_spin.setVisible(is_time)
-        self._interval_unit.setVisible(is_time)
-        self._skip_spin.setVisible(not is_time)
-
-    def _log_sys(self, msg: str, level: int = 0):
-        self._sys_log.append(msg)
-        c = self._sys_log.textCursor(); c.movePosition(QTextCursor.End); self._sys_log.setTextCursor(c)
-
-    def _log_ocr(self, text: str):
-        self._ocr_log.append(text)
-        c = self._ocr_log.textCursor(); c.movePosition(QTextCursor.End); self._ocr_log.setTextCursor(c)
-
-
-class ExportDialog(QDialog):
-    """视频导出对话框"""
-
-    def __init__(self, video_path: str, clips_path: str = "", parent=None,
-                 clip_ranges: list[TimeRange] | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("导出剪辑"); self.setMinimumSize(800, 600)
-        self._video_path = video_path
-        self._clips_path = clips_path
-        self._clip_ranges: list[TimeRange] = list(clip_ranges) if clip_ranges else []
-        self._output_path = ""
-        self._worker: ExportWorker | None = None
-
-        layout = QVBoxLayout(self)
-
-        g1 = QGroupBox("视频信息"); gl = QVBoxLayout(g1)
-        gl.addWidget(QLabel(f"视频: {os.path.basename(video_path)}" if video_path else "未打开视频"))
-        clips_label = QLabel("片段: 未加载"); gl.addWidget(clips_label); self._clips_label = clips_label
-        btn_load = QPushButton("加载剪辑数据(JSON)"); btn_load.clicked.connect(self._load_clips); gl.addWidget(btn_load)
-        layout.addWidget(g1)
-
-        g2 = QGroupBox("输出设置"); ol = QVBoxLayout(g2)
-        oph = QHBoxLayout(); oph.addWidget(QLabel("输出路径:"))
-        self._out_edit = QLineEdit(); self._out_edit.setReadOnly(True); oph.addWidget(self._out_edit)
-        btn_out = QPushButton("浏览..."); btn_out.clicked.connect(self._choose_output); oph.addWidget(btn_out)
-        ol.addLayout(oph); layout.addWidget(g2)
-
-        self._status = QLabel("准备导出..."); layout.addWidget(self._status)
-        self._progress = QProgressBar(); layout.addWidget(self._progress)
-
-        self._log = QTextEdit(); self._log.setReadOnly(True); layout.addWidget(self._log, 1)
-
-        bl = QHBoxLayout()
-        self._export_btn = QPushButton("开始导出"); self._export_btn.setProperty("cssClass", "primary")
-        self._export_btn.clicked.connect(self._start_export); bl.addWidget(self._export_btn)
-        btn_cancel = QPushButton("取消"); btn_cancel.clicked.connect(self._cancel); bl.addWidget(btn_cancel)
-        layout.addLayout(bl)
-
-        self._set_default_output()
-        if self._clip_ranges:
-            self._update_clips_label()
-        elif clips_path and os.path.exists(clips_path):
-            self._load_clips_file(clips_path)
-
-    def _set_default_output(self):
-        if not self._video_path: return
-        vd = os.path.dirname(self._video_path); vn = os.path.splitext(os.path.basename(self._video_path))[0]
-        self._output_path = os.path.join(vd, f"{vn}_highlights.mp4"); self._out_edit.setText(self._output_path)
-
-    def _choose_output(self):
-        vd = os.path.dirname(self._video_path) if self._video_path else ""
-        vn = os.path.splitext(os.path.basename(self._video_path))[0] if self._video_path else "highlights"
-        path, _ = QFileDialog.getSaveFileName(self, "保存剪辑", os.path.join(vd, f"{vn}_highlights.mp4"), "MP4 (*.mp4)")
-        if path:
-            if not path.endswith(".mp4"): path += ".mp4"
-            self._output_path = path; self._out_edit.setText(path)
-
-    def _load_clips(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择剪辑数据", "", "JSON文件 (*.json)")
-        if path: self._load_clips_file(path)
-
-    def _load_clips_file(self, path: str):
-        try:
-            with open(path, "r", encoding="utf-8") as f: data = json.load(f)
-            self._clip_ranges = [TimeRange(s, e) for s, e in data.get("clip_ranges", [])]
-            self._clips_path = path
-            self._update_clips_label()
-            self._log_msg(f"已加载: {len(self._clip_ranges)} 个片段")
-        except Exception as e: QMessageBox.critical(self, "错误", str(e))
-
-    def _update_clips_label(self):
-        self._clips_label.setText(f"片段: {len(self._clip_ranges)} 个")
-
-    def _start_export(self):
-        if not self._output_path: QMessageBox.warning(self, "错误", "请选择输出路径"); return
-        if not self._clip_ranges: QMessageBox.warning(self, "错误", "没有可导出的片段"); return
-
-        self._export_btn.setEnabled(False); self._progress.setValue(0)
-        config = ExportConfig(output_path=self._output_path)
-        self._worker = ExportWorker(self._video_path, self._clip_ranges, config)
-        self._worker.progress.connect(lambda p, m: (self._progress.setValue(p), self._status.setText(m)))
-        self._worker.log.connect(lambda m, t: self._log_msg(m))
-        self._worker.finished.connect(self._on_export_done)
-        self._worker.start()
-
-    def _on_export_done(self, success: bool, message: str):
-        self._export_btn.setEnabled(True)
-        if success: QMessageBox.information(self, "完成", message)
-        else: QMessageBox.warning(self, "失败", message)
-
-    def _cancel(self):
-        if self._worker: self._worker.cancel(); self._export_btn.setEnabled(True)
-
-    def _log_msg(self, msg: str):
-        self._log.append(msg)
-        c = self._log.textCursor(); c.movePosition(QTextCursor.End); self._log.setTextCursor(c)
