@@ -16,9 +16,9 @@ def main():
     print("=" * 40)
     print()
 
-    venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
-    python = str(venv_python) if venv_python.exists() else sys.executable
-    tag = "venv" if venv_python.exists() else "system"
+    runtime_python = ROOT / "runtime" / "python.exe"
+    python = str(runtime_python) if runtime_python.exists() else sys.executable
+    tag = "runtime" if runtime_python.exists() else "system"
     print(f"[环境] Python: {python} ({tag})")
 
     print("[检查] 验证依赖...")
