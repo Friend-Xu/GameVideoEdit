@@ -83,7 +83,7 @@ class KeywordMatcher:
             desc_part = descs if rule.get("require_descriptor") else descs + "?"
         if rule.get("require_signal"):
             rs = rule["require_signal"]
-            pat = actor + r".+?" + rs + r".+?" + desc_part + r".*?" + action + r"了?"
+            pat = actor + r".+?" + rs + r".*?" + desc_part + r".*?" + action + r"了?"
         else:
             pat = actor + r".+?" + desc_part + r".*?" + action + r"了?"
         return re.compile(pat)

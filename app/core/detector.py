@@ -3,6 +3,9 @@
 整合 EasyOCR、图像预处理、关键词匹配。
 """
 
+import json
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -51,34 +54,400 @@ class DetectionResult(TimeRange):
     actor: str = ""
     pattern_id: str = ""
     match_count: int = 1
+    source: str = "text"  # "text", "counter", "both"
 
 
 @dataclass
+class SignalEvent:
+    """推入事件栈的原子信号 —— 统一文本匹配和计数器跳变"""
+    timestamp: float
+    action: str = ""
+    actor: str = ""
+    pattern_id: str = ""
+    raw_text: str = ""
+    source: str = "text"  # "text" or "counter"
+
+
+@dataclass
+class EventStackConfig:
+    """事件栈配置 —— 每种信号类型的 wait_after"""
+    wait_after: dict[str, float] = field(default_factory=lambda: {
+        "淘汰": 10.0, "击倒": 30.0, "counter": 10.0,
+    })
+    padding_before: float = 10.0
+    padding_after: float = 10.0
+
+
+@dataclass
+class FrameLog:
+    """单帧、单个ROI的一次OCR处理记录"""
+    frame_number: int
+    timestamp: float
+    roi_id: int
+    roi_label: str
+    stage: str = "ocr"
+    ocr_text: str = ""
+    ocr_confidence: float = 0.0
+    match_hit: bool = False
+    match_pattern_id: str = ""
+    match_action: str = ""
+    match_actor: str = ""
+    counter_value: int = -1
+    counter_delta: int = 0
+    dropped: bool = False
+    drop_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "frame": self.frame_number, "ts": round(self.timestamp, 2),
+            "roi_id": self.roi_id, "roi_label": self.roi_label,
+            "stage": self.stage,
+            "ocr_text": self.ocr_text, "ocr_confidence": self.ocr_confidence,
+            "match_hit": self.match_hit, "match_pattern_id": self.match_pattern_id,
+            "match_action": self.match_action, "match_actor": self.match_actor,
+            "counter_value": self.counter_value, "counter_delta": self.counter_delta,
+            "dropped": self.dropped, "drop_reason": self.drop_reason,
+        }
+
+
+@dataclass
+class DroppedRecord:
+    frame_number: int
+    timestamp: float
+    roi_label: str
+    ocr_text: str
+    ocr_confidence: float
+    reason: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "frame": self.frame_number, "ts": round(self.timestamp, 2),
+            "roi_label": self.roi_label,
+            "ocr_text": self.ocr_text, "ocr_confidence": self.ocr_confidence,
+            "reason": self.reason, "detail": self.detail,
+        }
+
+
+@dataclass
+class RunSummary:
+    total_frames: int = 0
+    frames_with_ocr_hits: int = 0
+    frames_with_matches: int = 0
+    counter_total_events: int = 0
+    counter_total_delta: int = 0
+    dropped_total: int = 0
+    dropped_by_reason: dict = field(default_factory=dict)
+    detections_before_merge: int = 0
+    detections_after_merge: int = 0
+    elapsed_seconds: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "total_frames": self.total_frames,
+            "frames_with_ocr_hits": self.frames_with_ocr_hits,
+            "frames_with_matches": self.frames_with_matches,
+            "counter_total_events": self.counter_total_events,
+            "counter_total_delta": self.counter_total_delta,
+            "dropped_total": self.dropped_total,
+            "dropped_by_reason": self.dropped_by_reason,
+            "detections_before_merge": self.detections_before_merge,
+            "detections_after_merge": self.detections_after_merge,
+            "elapsed_seconds": round(self.elapsed_seconds, 1),
+        }
+
+
 class DetectionReport:
-    video_path: str
-    total_frames: int
-    processed_frames: int
-    detection_count: int
-    time_ranges: list[TimeRange]
-    all_detections: list[FrameResult] = field(default_factory=list)
+    """一次检测运行的完整报告"""
+
+    def __init__(self, video_path: str = "", video_width: int = 0,
+                 video_height: int = 0, video_fps: float = 30.0,
+                 video_duration_sec: float = 0.0, config: dict | None = None,
+                 rois: list[dict] | None = None):
+        self.video_path = video_path
+        self.video_width = video_width
+        self.video_height = video_height
+        self.video_fps = video_fps
+        self.video_duration_sec = video_duration_sec
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.config = config or {}
+        self.rois = rois or []
+        self.frames_log: list[FrameLog] = []
+        self.dropped: list[DroppedRecord] = []
+        self.counter_events: list[dict] = []
+        self.results: list[dict] = []
+        self.summary = RunSummary()
+
+    def to_dict(self) -> dict:
+        return {
+            "video_path": self.video_path,
+            "video_width": self.video_width,
+            "video_height": self.video_height,
+            "video_fps": self.video_fps,
+            "video_duration_sec": self.video_duration_sec,
+            "started_at": self.started_at,
+            "config": self.config,
+            "rois": self.rois,
+            "frames_log": [f.to_dict() for f in self.frames_log],
+            "dropped": [d.to_dict() for d in self.dropped],
+            "counter_events": self.counter_events,
+            "results": self.results,
+            "summary": self.summary.to_dict(),
+        }
+
+    def save_json(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load_json(cls, path: str) -> "DetectionReport":
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        r = cls(
+            video_path=raw.get("video_path", ""),
+            video_width=raw.get("video_width", 0),
+            video_height=raw.get("video_height", 0),
+            video_fps=raw.get("video_fps", 30.0),
+            video_duration_sec=raw.get("video_duration_sec", 0.0),
+            config=raw.get("config", {}),
+            rois=raw.get("rois", []),
+        )
+        r.started_at = raw.get("started_at", "")
+        r.frames_log = [
+            FrameLog(
+                frame_number=fl.get("frame", 0), timestamp=fl.get("ts", 0.0),
+                roi_id=fl.get("roi_id", 0), roi_label=fl.get("roi_label", ""),
+                stage=fl.get("stage", "ocr"),
+                ocr_text=fl.get("ocr_text", ""), ocr_confidence=fl.get("ocr_confidence", 0.0),
+                match_hit=fl.get("match_hit", False),
+                match_pattern_id=fl.get("match_pattern_id", ""),
+                match_action=fl.get("match_action", ""),
+                match_actor=fl.get("match_actor", ""),
+                counter_value=fl.get("counter_value", -1),
+                counter_delta=fl.get("counter_delta", 0),
+                dropped=fl.get("dropped", False), drop_reason=fl.get("drop_reason", ""),
+            )
+            for fl in raw.get("frames_log", [])
+        ]
+        r.dropped = [
+            DroppedRecord(
+                frame_number=d.get("frame", 0), timestamp=d.get("ts", 0.0),
+                roi_label=d.get("roi_label", ""),
+                ocr_text=d.get("ocr_text", ""), ocr_confidence=d.get("ocr_confidence", 0.0),
+                reason=d.get("reason", ""), detail=d.get("detail", ""),
+            )
+            for d in raw.get("dropped", [])
+        ]
+        r.counter_events = raw.get("counter_events", [])
+        r.results = raw.get("results", [])
+        s = raw.get("summary", {})
+        r.summary = RunSummary(**s)
+        return r
+
+
+class CounterTracker:
+    """淘汰计数器追踪：数字递增 = 淘汰事件，跳变说明漏检"""
+
+    def __init__(self):
+        self._count = 0
+        self._started = False
+        self.events: list[tuple[float, int]] = []  # (timestamp, delta)
+        self.on_event: Callable[[SignalEvent], None] | None = None
+
+    def feed(self, timestamp: float, text: str, log_cb=None) -> int:
+        """返回当前读数；log_cb(report, stage, value, delta) 可空"""
+        num = self._extract_number(text)
+        if num is None:
+            if log_cb:
+                log_cb(timestamp, "counter_track", -1, 0,
+                       text, "parse_number_failed", False)
+            return self._count
+        if not self._started:
+            self._count = num
+            self._started = True
+            if log_cb:
+                log_cb(timestamp, "counter_track", num, 0, text, "", False)
+            return self._count
+        delta = num - self._count
+        if delta > 0:
+            self.events.append((timestamp, delta))
+            if self.on_event:
+                for i in range(delta):
+                    self.on_event(SignalEvent(
+                        timestamp=timestamp + i * 0.001,
+                        action="淘汰", actor="自己",
+                        pattern_id="counter", source="counter",
+                    ))
+        elif delta < -3 and self._count >= 7 and num <= 3:
+            if log_cb:
+                log_cb(timestamp, "counter_reset", num, delta, text, "", False)
+            self._count = num
+            return self._count
+        self._count = max(self._count, num)
+        if log_cb:
+            log_cb(timestamp, "counter_track", num, max(delta, 0), text, "", delta > 0)
+        return self._count
+
+    @staticmethod
+    def _extract_number(text: str) -> int | None:
+        m = re.search(r"(\d+)", text)
+        return int(m.group(1)) if m else None
+
+    def reset(self):
+        self._count = 0
+        self._started = False
+        self.events.clear()
+
+
+class EventStackEngine:
+    """事件栈：按 (action, actor) 分栈，同类型事件合并，不同类型独立。"""
+
+    def __init__(self, config: EventStackConfig):
+        self._cfg = config
+        self._stacks: dict[tuple[str, str], list[SignalEvent]] = {}
+        self._deadlines: dict[tuple[str, str], float] = {}
+        self._results: list[DetectionResult] = []
+        self.total_pushed: int = 0
+
+    def push(self, event: SignalEvent) -> None:
+        self.total_pushed += 1
+        key = (event.action, event.actor) if event.actor else (event.action, "")
+        # 先检查所有其他栈是否过期
+        for k in list(self._stacks.keys()):
+            if k != key and self._stacks[k] and event.timestamp > self._deadlines.get(k, 0):
+                self._pop_key(k)
+        # 当前栈：超时则先出栈
+        if self._stacks.get(key) and event.timestamp > self._deadlines.get(key, 0):
+            self._pop_key(key)
+        self._stacks.setdefault(key, []).append(event)
+        actor_key = f"{event.action}:{event.actor}" if event.actor else event.action
+        wait = self._cfg.wait_after.get(actor_key) or self._cfg.wait_after.get(event.action, 15.0)
+        self._deadlines[key] = max(self._deadlines.get(key, 0), event.timestamp + wait)
+
+    def flush(self) -> list[DetectionResult]:
+        for k in list(self._stacks.keys()):
+            self._pop_key(k)
+        return self._results
+
+    def _pop_key(self, key: tuple[str, str]) -> None:
+        events = self._stacks.pop(key, [])
+        self._deadlines.pop(key, None)
+        if not events:
+            return
+        has_text = any(e.source == "text" for e in events)
+        has_counter = any(e.source == "counter" for e in events)
+        if has_text and has_counter:
+            src = "both"
+        elif has_counter:
+            src = "counter"
+        else:
+            src = "text"
+        self._results.append(DetectionResult(
+            start_sec=max(0.0, events[0].timestamp - self._cfg.padding_before),
+            end_sec=events[-1].timestamp + self._cfg.padding_after,
+            action=key[0], actor=key[1], pattern_id=events[0].pattern_id,
+            match_count=len(events), source=src,
+        ))
+
+
+class TextFusionBuffer:
+    """多帧 OCR 文本融合缓冲区 —— 借鉴 video-subtitle-extractor / GameSentenceMiner。
+
+    滑动窗口内收集 OCR 结果，按 Levenshtein 相似度聚类。
+    当同类文本被多次确认后，返回融合后的最佳文本。
+    """
+
+    def __init__(self, window_sec: float = 3.0, min_confirmations: int = 2,
+                 sim_threshold: float = 0.6):
+        self._window = window_sec
+        self._min_confirm = min_confirmations
+        self._sim_threshold = sim_threshold
+        self._buffer: list[tuple[float, str, float]] = []  # (timestamp, text, confidence)
+
+    def feed(self, timestamp: float, text: str, confidence: float) -> str | None:
+        """输入一次 OCR 结果。返回融合文本或 None（等待更多帧）。"""
+        if not text or not text.strip():
+            return None
+        # 清理窗口外旧数据
+        self._buffer = [(ts, t, c) for ts, t, c in self._buffer
+                        if timestamp - ts <= self._window]
+        self._buffer.append((timestamp, text, confidence))
+        # 聚类
+        clusters = self._cluster()
+        # 查找已确认的聚类
+        for cluster in clusters:
+            if len(cluster) >= self._min_confirm:
+                return self._fuse(cluster)
+        return None
+
+    def _cluster(self) -> list[list[tuple[float, str, float]]]:
+        """按 Levenshtein 相似度聚类"""
+        if not self._buffer:
+            return []
+        clusters: list[list[tuple[float, str, float]]] = []
+        for entry in self._buffer:
+            placed = False
+            for cluster in clusters:
+                if self._levenshtein_ratio(entry[1], cluster[0][1]) >= self._sim_threshold:
+                    cluster.append(entry)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([entry])
+        return clusters
+
+    def _fuse(self, cluster: list[tuple[float, str, float]]) -> str:
+        """从聚类中选出最佳文本：最长 + 最高置信度"""
+        best = max(cluster, key=lambda e: (len(e[1]), e[2]))
+        return best[1]
+
+    @staticmethod
+    def _levenshtein_ratio(a: str, b: str) -> float:
+        """Levenshtein 相似度 (0.0-1.0)"""
+        if not a or not b:
+            return 0.0
+        n, m = len(a), len(b)
+        if n == 0 or m == 0:
+            return 0.0
+        # 使用两行 DP 减少内存
+        prev = list(range(m + 1))
+        curr = [0] * (m + 1)
+        for i in range(1, n + 1):
+            curr[0] = i
+            for j in range(1, m + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+            prev, curr = curr, prev
+        distance = prev[m]
+        return 1.0 - (distance / max(n, m))
 
 
 class OCRDetector:
-    """OCR 检测器"""
+    """OCR 检测器 —— GPU 调用通过类级锁保证线程安全"""
+
+    _gpu_lock = threading.Lock()
 
     def __init__(self, gpu: bool = True, languages: list[str] | None = None):
         if languages is None:
             languages = ["ch_sim", "en"]
         self._reader = ModelManager().get_easyocr_reader(gpu=gpu, languages=languages)
+        self._gpu = gpu
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     def detect(self, roi_image: np.ndarray) -> list[OCRResult]:
         if roi_image is None or roi_image.size == 0:
             return []
-        processed = self._preprocess(roi_image)
-        try:
-            raw = self._reader.readtext(processed)
-        except Exception:
+        return self.detect_raw(self._preprocess(roi_image))
+
+    def detect_raw(self, preprocessed: np.ndarray) -> list[OCRResult]:
+        """直接对已预处理的图像做 GPU OCR，跳过预处理"""
+        if preprocessed is None or preprocessed.size == 0:
             return []
+        with self._gpu_lock:
+            try:
+                raw = self._reader.readtext(preprocessed)
+            except Exception:
+                return []
         results: list[OCRResult] = []
         for bbox, text, conf in raw:
             if conf < 0.3:
@@ -93,10 +462,186 @@ class OCRDetector:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image.copy()
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
-        return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+        enhanced = self._clahe.apply(gray)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
+class TextPresenceGate:
+    """文字存在性门控 —— 灰度 + 阈值 + 白像素计数，<1ms 判断 ROI 内是否有文字。
+
+    FPS 游戏中击杀信息为白色文字，半透明深色底条。
+    对 ROI 做高阈值二值化，白像素数 > min_white 即认为有文字。
+    """
+
+    def __init__(self, threshold: int = 230, min_white: int = 200,
+                 change_ratio: float = 0.15):
+        self._threshold = threshold
+        self._min_white = min_white
+        self._change_ratio = change_ratio
+        self._last_white: int = 0
+        self._last_has_text: bool = False
+
+    def check(self, roi_image: np.ndarray) -> tuple[bool, bool]:
+        """返回 (has_text, is_new) —— 是否有文字，是否是新出现的/变化的文字"""
+        gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, self._threshold, 255, cv2.THRESH_BINARY)
+        white = cv2.countNonZero(mask)
+        has_text = white >= self._min_white
+        if not has_text:
+            self._last_white = white
+            self._last_has_text = False
+            return False, False
+        if not self._last_has_text:
+            # 文字刚出现
+            self._last_white = white
+            self._last_has_text = True
+            return True, True
+        # 文字持续存在 — 检查是否有明显变化（新击杀信息）
+        if white > 0:
+            ratio = abs(white - self._last_white) / white
+            is_new = ratio > self._change_ratio
+        else:
+            is_new = True
+        self._last_white = white
+        self._last_has_text = True
+        return True, is_new
+
+    def reset(self):
+        self._last_white = 0
+        self._last_has_text = False
+
+
+class FramePrefetcher:
+    """CPU 并行预取器 —— 每个 worker 独立 VideoPlayer，seek + 文字门控 + 预处理一体化。
+
+    用法:
+        prefetcher = FramePrefetcher(video_path, detector, rois, fps, num_workers=4)
+        prefetcher.start()
+        for fn in frame_list:
+            prefetcher.submit(fn)
+        while (result := prefetcher.next_result()) is not None:
+            fn, prepped, timestamp, has_text = result
+            if has_text: process(prepped)
+        prefetcher.stop()
+    """
+
+    def __init__(self, video_path: str, detector: OCRDetector, rois: list,
+                 fps: float, num_workers: int = 4):
+        import queue
+        self._video_path = video_path
+        self._detector = detector
+        self._rois = rois
+        self._fps = fps
+        self._num_workers = num_workers
+        self._input_queue: queue.Queue = queue.Queue(maxsize=num_workers * 3)
+        self._output_queue: queue.Queue = queue.Queue()
+        self._workers: list[threading.Thread] = []
+        self._running = False
+        self._submitted = 0
+        self._collected = 0
+        # 找出击杀信息 ROI
+        self._kill_roi_index = 0
+        for i, roi in enumerate(rois):
+            lbl = getattr(roi, 'label', '') if hasattr(roi, 'label') else roi.get('label', '')
+            if lbl == '击杀信息':
+                self._kill_roi_index = i
+                break
+        self._text_gate = TextPresenceGate()
+
+    def start(self):
+        self._running = True
+        for _ in range(self._num_workers):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def stop(self):
+        for _ in self._workers:
+            try:
+                self._input_queue.put_nowait(None)
+            except Exception:
+                pass
+        self._running = False
+
+    def submit(self, frame_number: int):
+        """提交一帧到预处理队列（非阻塞，队列满时等待）"""
+        self._input_queue.put(frame_number)
+        self._submitted += 1
+
+    def next_result(self):
+        """获取下一个预处理完成的 ROI（阻塞直到有结果或结束）"""
+        if self._collected >= self._submitted:
+            return None
+        result = self._output_queue.get()
+        if result is None:
+            return None
+        self._collected += 1
+        return result
+
+    def next_result_nowait(self):
+        """获取已完成的结果（非阻塞，无结果时抛出 queue.Empty）"""
+        if self._collected >= self._submitted:
+            return None
+        result = self._output_queue.get_nowait()
+        if result is None:
+            return None
+        self._collected += 1
+        return result
+
+    @property
+    def pending(self) -> int:
+        return self._submitted - self._collected
+
+    def _worker(self):
+        """CPU 工作线程：独立 VideoPlayer → seek → 文字门控 + 裁剪 + 预处理 → 输出队列"""
+        from app.core.player import VideoPlayer
+        player = VideoPlayer()
+        try:
+            player.open(self._video_path)
+        except Exception:
+            return
+        try:
+            while self._running:
+                try:
+                    fn = self._input_queue.get(timeout=0.5)
+                except Exception:
+                    continue
+                if fn is None:
+                    break
+                try:
+                    frame = player.seek(fn)
+                    if frame is None:
+                        self._output_queue.put((fn, [], 0.0, False))
+                        continue
+                    timestamp = fn / max(self._fps, 1)
+                    # 文字门控：快速检查击杀信息 ROI
+                    roi = self._rois[self._kill_roi_index]
+                    if hasattr(roi, 'x'):
+                        kill_img = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
+                    else:
+                        kill_img = frame[roi['y']:roi['y'] + roi['h'],
+                                         roi['x']:roi['x'] + roi['w']]
+                    has_text, _ = self._text_gate.check(kill_img)
+                    if not has_text:
+                        self._output_queue.put((fn, [], timestamp, False))
+                        continue
+                    # 有文字 → 预处理所有 ROI
+                    prepped = []
+                    for roi in self._rois:
+                        if hasattr(roi, 'x'):
+                            roi_img = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
+                        else:
+                            roi_img = frame[roi['y']:roi['y'] + roi['h'],
+                                             roi['x']:roi['x'] + roi['w']]
+                        prepped.append((self._detector._preprocess(roi_img), roi))
+                    self._output_queue.put((fn, prepped, timestamp, True))
+                except Exception:
+                    self._output_queue.put((fn, [], 0.0, False))
+        finally:
+            try:
+                player.close()
+            except Exception:
+                pass
 
 
 class DetectionEngine:
@@ -107,7 +652,8 @@ class DetectionEngine:
                  skip_frames: int = 3, merge_gap: float = 30.0,
                  mode: str = "frame", interval_sec: float = 1.0,
                  post_detect_skip_sec: float = 0.3,
-                 allowed_actors: set | None = None):
+                 allowed_actors: set | None = None,
+                 wait_after: dict[str, float] | None = None):
         self._matcher = matcher
         self._detector = detector
         self.padding_before = padding_before
@@ -118,33 +664,257 @@ class DetectionEngine:
         self.interval_sec = interval_sec
         self.post_detect_skip_sec = post_detect_skip_sec
         self.allowed_actors = allowed_actors
+        self._wait_after = wait_after
+        self._counter = CounterTracker()
+        self._report: DetectionReport | None = None
+        self._config_meta: dict = {}
+        self._fusion_buffer = TextFusionBuffer()
+        self._roi_snapshot: dict[str, np.ndarray] = {}
+        self._roi_frame_gap: dict[str, int] = {}
+
+    def _ensure_report(self, video_info, annotations) -> DetectionReport:
+        if self._report is None:
+            roi_dicts = [{"id": r.id, "label": r.label} for r in annotations.regions]
+            duration = video_info.total_frames / max(video_info.fps, 1)
+            self._report = DetectionReport(
+                video_path=video_info.path if hasattr(video_info, 'path') else "",
+                video_width=video_info.width, video_height=video_info.height,
+                video_fps=video_info.fps, video_duration_sec=duration,
+                config=self._config_meta, rois=roi_dicts,
+            )
+        return self._report
+
+    def _log_counter(self, timestamp: float, stage: str, value: int, delta: int,
+                     raw_text: str, drop_reason: str, is_event: bool):
+        if self._report is None:
+            return
+        fl = FrameLog(
+            frame_number=int(timestamp * (self._report.video_fps or 30)),
+            timestamp=timestamp, roi_id=0, roi_label="淘汰计数",
+            stage=stage, ocr_text=raw_text, ocr_confidence=0.0,
+            counter_value=value, counter_delta=delta,
+            dropped=bool(drop_reason), drop_reason=drop_reason,
+        )
+        self._report.frames_log.append(fl)
+        if drop_reason:
+            self._report.dropped.append(DroppedRecord(
+                frame_number=fl.frame_number, timestamp=timestamp,
+                roi_label="淘汰计数", ocr_text=raw_text, ocr_confidence=0.0,
+                reason=drop_reason, detail=f"raw_text='{raw_text}'",
+            ))
+        if is_event:
+            self._report.counter_events.append({
+                "timestamp": round(timestamp, 2), "delta": delta,
+                "new_count": value,
+            })
 
     def process_frame(self, frame: np.ndarray, rois: list,
-                      fps: float, frame_number: int) -> FrameResult:
+                      fps: float, frame_number: int,
+                      raw_ocr_cb=None) -> FrameResult:
         frame_matched: MatchResult | None = None
         frame_hits: list[OCRResult] = []
-        for roi in rois:
+        timestamp = frame_number / fps
+        for i, roi in enumerate(rois):
             if hasattr(roi, 'x'):
                 roi_img = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
+                label = getattr(roi, 'label', '击杀信息')
             else:
                 roi_img = frame[roi['y']:roi['y'] + roi['h'], roi['x']:roi['x'] + roi['w']]
-            for ocr_r in self._detector.detect(roi_img):
-                match = self._matcher.match(ocr_r.text)
-                if match:
-                    if self.allowed_actors is not None and match.actor not in self.allowed_actors:
+                label = roi.get('label', '击杀信息')
+            roi_id = self._roi_id(roi, i)
+            if label == '淘汰计数':
+                for ocr_r in self._detector.detect(roi_img):
+                    self._counter.feed(timestamp, ocr_r.text,
+                                       log_cb=self._log_counter)
+                    if raw_ocr_cb:
+                        raw_ocr_cb(timestamp, ocr_r.text, label)
+            else:
+                ocr_results = self._detector.detect(roi_img)
+                if not ocr_results:
+                    self._log_keyword(timestamp, frame_number, roi_id, label,
+                                      ocr_text="", ocr_conf=0.0, match=None,
+                                      prefix_ok=False, drop_reason="ocr_no_text")
+                # 拼接同帧同 ROI 的碎片文本（按 x 坐标排序）
+                if len(ocr_results) > 1:
+                    sorted_results = sorted(ocr_results, key=lambda r: r.bbox[0])
+                    joined_text = "".join(r.text for r in sorted_results)
+                    joined_conf = min(r.confidence for r in ocr_results)
+                    joined_match = self._matcher.match(joined_text)
+                    if joined_match and (self.allowed_actors is None or joined_match.actor in self.allowed_actors):
+                        self._fusion_buffer.feed(timestamp, joined_text, joined_conf)
+                        for ocr_r in ocr_results:
+                            if raw_ocr_cb:
+                                raw_ocr_cb(timestamp, ocr_r.text, label)
+                        frame_hits.extend(ocr_results)
+                        if frame_matched is None:
+                            frame_matched = joined_match
+                        self._log_keyword(timestamp, frame_number, roi_id, label,
+                                          joined_text, joined_conf, joined_match,
+                                          True, "joined_fragments")
                         continue
-                    frame_hits.append(ocr_r)
-                    if frame_matched is None:
-                        frame_matched = match
+                for ocr_r in ocr_results:
+                    if raw_ocr_cb:
+                        raw_ocr_cb(timestamp, ocr_r.text, label)
+                    has_prefix = self._matcher.has_trigger_prefix(ocr_r.text)
+                    match = self._matcher.match(ocr_r.text)
+                    if match:
+                        # 直接匹配成功 — 同时喂入融合缓冲区供后续纠错
+                        self._fusion_buffer.feed(timestamp, ocr_r.text, ocr_r.confidence)
+                        if self.allowed_actors is not None and match.actor not in self.allowed_actors:
+                            continue
+                        frame_hits.append(ocr_r)
+                        if frame_matched is None:
+                            frame_matched = match
+                        self._log_keyword(timestamp, frame_number, roi_id, label,
+                                          ocr_r.text, ocr_r.confidence, match,
+                                          has_prefix, "")
+                    else:
+                        # 直接匹配失败 — 尝试融合缓冲区纠错
+                        fused_text = self._fusion_buffer.feed(
+                            timestamp, ocr_r.text, ocr_r.confidence)
+                        if fused_text:
+                            fused_match = self._matcher.match(fused_text)
+                            if fused_match:
+                                if self.allowed_actors is not None and fused_match.actor not in self.allowed_actors:
+                                    continue
+                                frame_hits.append(ocr_r)
+                                if frame_matched is None:
+                                    frame_matched = fused_match
+                                self._log_keyword(timestamp, frame_number, roi_id, label,
+                                                  fused_text, ocr_r.confidence, fused_match,
+                                                  True, "fused_correction")
+                                continue
+                        # 无法匹配 — 记录丢弃原因
+                        reason = ""
+                        if not has_prefix:
+                            reason = "no_trigger_prefix"
+                        elif ocr_r.confidence < 0.3:
+                            reason = "low_confidence"
+                        else:
+                            reason = "regex_no_match"
+                        self._log_keyword(timestamp, frame_number, roi_id, label,
+                                          ocr_r.text, ocr_r.confidence, None,
+                                          has_prefix, reason)
         return FrameResult(
-            frame_number=frame_number, timestamp=frame_number / fps,
+            frame_number=frame_number, timestamp=timestamp,
             detected=frame_matched is not None,
             ocr_results=frame_hits, match_result=frame_matched,
         )
 
+    def _match_prepped(self, prepped_rois: list, rois: list,
+                       timestamp: float, fn: int, raw_ocr_cb=None):
+        """对预处理器输出的 ROI 图像做 GPU OCR + 关键词匹配"""
+        from app.core.keywords import MatchResult
+        frame_matched: MatchResult | None = None
+        for roi_img, roi in prepped_rois:
+            if hasattr(roi, 'x'):
+                label = getattr(roi, 'label', '击杀信息')
+            else:
+                label = roi.get('label', '击杀信息')
+            roi_id = self._roi_id(roi, 0)
+            if label == '淘汰计数':
+                for ocr_r in self._detector.detect_raw(roi_img):
+                    self._counter.feed(timestamp, ocr_r.text,
+                                       log_cb=self._log_counter)
+                    if raw_ocr_cb:
+                        raw_ocr_cb(timestamp, ocr_r.text, label)
+            else:
+                ocr_results = self._detector.detect_raw(roi_img)
+                if not ocr_results:
+                    self._log_keyword(timestamp, fn, roi_id, label,
+                                      ocr_text="", ocr_conf=0.0, match=None,
+                                      prefix_ok=False, drop_reason="ocr_no_text")
+                # 拼接同帧同 ROI 的碎片文本（按 x 坐标排序）
+                if len(ocr_results) > 1:
+                    sorted_results = sorted(ocr_results, key=lambda r: r.bbox[0])
+                    joined_text = "".join(r.text for r in sorted_results)
+                    joined_conf = min(r.confidence for r in ocr_results)
+                    joined_match = self._matcher.match(joined_text)
+                    if joined_match and (self.allowed_actors is None or joined_match.actor in self.allowed_actors):
+                        self._fusion_buffer.feed(timestamp, joined_text, joined_conf)
+                        for ocr_r in ocr_results:
+                            if raw_ocr_cb:
+                                raw_ocr_cb(timestamp, ocr_r.text, label)
+                        if frame_matched is None:
+                            frame_matched = joined_match
+                        self._log_keyword(timestamp, fn, roi_id, label,
+                                          joined_text, joined_conf, joined_match,
+                                          True, "joined_fragments")
+                        continue
+                for ocr_r in ocr_results:
+                    if raw_ocr_cb:
+                        raw_ocr_cb(timestamp, ocr_r.text, label)
+                    has_prefix = self._matcher.has_trigger_prefix(ocr_r.text)
+                    match = self._matcher.match(ocr_r.text)
+                    if match:
+                        self._fusion_buffer.feed(timestamp, ocr_r.text, ocr_r.confidence)
+                        if self.allowed_actors is not None and match.actor not in self.allowed_actors:
+                            continue
+                        if frame_matched is None:
+                            frame_matched = match
+                        self._log_keyword(timestamp, fn, roi_id, label,
+                                          ocr_r.text, ocr_r.confidence, match,
+                                          has_prefix, "")
+                    else:
+                        fused_text = self._fusion_buffer.feed(
+                            timestamp, ocr_r.text, ocr_r.confidence)
+                        if fused_text:
+                            fused_match = self._matcher.match(fused_text)
+                            if fused_match:
+                                if self.allowed_actors is not None and fused_match.actor not in self.allowed_actors:
+                                    continue
+                                if frame_matched is None:
+                                    frame_matched = fused_match
+                                self._log_keyword(timestamp, fn, roi_id, label,
+                                                  fused_text, ocr_r.confidence, fused_match,
+                                                  True, "fused_correction")
+                                continue
+                        reason = ""
+                        if not has_prefix:
+                            reason = "no_trigger_prefix"
+                        elif ocr_r.confidence < 0.3:
+                            reason = "low_confidence"
+                        else:
+                            reason = "regex_no_match"
+                        self._log_keyword(timestamp, fn, roi_id, label,
+                                          ocr_r.text, ocr_r.confidence, None,
+                                          has_prefix, reason)
+        return frame_matched
+
+    @staticmethod
+    def _roi_id(roi, index: int) -> int:
+        if hasattr(roi, 'label') and hasattr(roi, 'x'):
+            return index  # PixelROI has no id; use index
+        return roi.get('id', index) if isinstance(roi, dict) else index
+
+    def _log_keyword(self, timestamp: float, fn: int, roi_id: int, label: str,
+                     ocr_text: str, ocr_conf: float, match,
+                     prefix_ok: bool, drop_reason: str):
+        if self._report is None:
+            return
+        fl = FrameLog(
+            frame_number=fn, timestamp=timestamp, roi_id=roi_id, roi_label=label,
+            stage="keyword_match" if match else "ocr",
+            ocr_text=ocr_text, ocr_confidence=round(ocr_conf, 4),
+            match_hit=match is not None,
+            match_pattern_id=match.pattern_id if match else "",
+            match_action=match.action if match else "",
+            match_actor=match.actor if match else "",
+            dropped=bool(drop_reason), drop_reason=drop_reason,
+        )
+        self._report.frames_log.append(fl)
+        if drop_reason:
+            self._report.dropped.append(DroppedRecord(
+                frame_number=fn, timestamp=timestamp, roi_label=label,
+                ocr_text=ocr_text, ocr_confidence=round(ocr_conf, 4),
+                reason=drop_reason,
+                detail=f"prefix_ok={prefix_ok}" if drop_reason == "no_trigger_prefix" else "",
+            ))
+
     def run_full(self, video_path: str, annotations, start_frame: int = 0,
                  end_frame: int | None = None,
-                 progress_cb=None, detected_cb=None, cancel_check=None
+                 progress_cb=None, detected_cb=None, cancel_check=None,
+                 raw_ocr_cb=None,
                  ) -> list[TimeRange]:
         """完整检测管线 — GUI 线程和 CLI 共用。
 
@@ -154,125 +924,170 @@ class DetectionEngine:
             start_frame: 起始帧号
             end_frame: 结束帧号，None=视频末尾
             progress_cb: 进度回调 (pct: float) -> None
-            detected_cb: 检测回调 (timestamp: float, text: str) -> None
+            detected_cb: 匹配成功回调 (timestamp: float, text: str) -> None
             cancel_check: 取消检查 () -> bool
+            raw_ocr_cb: 原始 OCR 回调 (timestamp: float, text: str, roi_label: str) -> None
 
         Returns:
-            list[TimeRange] 合并后的时间段
+            (list[DetectionResult], DetectionReport) 合并结果和完整报告
         """
         from app.core.player import VideoPlayer
 
+        _run_start = time.time()
         player = VideoPlayer()
         info = player.open(video_path)
         fps = info.fps
         end = end_frame if end_frame is not None else (info.total_frames - 1)
         rois = annotations.to_pixel_rois(info.width, info.height)
 
+        self._config_meta = {
+            "mode": self.mode, "interval_sec": self.interval_sec,
+            "skip_frames": self.skip_frames,
+            "padding_before": self.padding_before, "padding_after": self.padding_after,
+            "merge_gap": self.merge_gap,
+            "post_detect_skip_sec": self.post_detect_skip_sec,
+        }
+        self._report = self._ensure_report(info, annotations)
+        self._report.video_path = video_path
+
         if not rois:
             player.close()
-            return []
+            return [], self._report
 
-        detections: list[FrameResult] = []
+        self._counter.reset()
+        self._counter.on_event = None
+        stack = EventStackEngine(EventStackConfig(
+            wait_after=self._wait_after or {},
+            padding_before=self.padding_before,
+            padding_after=self.padding_after,
+        ))
+        self._counter.on_event = stack.push
 
         if self.mode == "time":
             start_sec = start_frame / fps
             end_sec = end / fps
+            frame_list = []
             current_time = start_sec
-            while current_time <= end_sec and not (cancel_check and cancel_check()):
+            while current_time <= end_sec:
                 fn = int(current_time * fps)
                 if fn > end:
                     break
-                try:
-                    frame = player.seek(fn)
-                except Exception:
-                    current_time += self.interval_sec
-                    continue
+                frame_list.append(fn)
+                current_time += self.interval_sec
 
-                result = self.process_frame(frame, rois, fps, fn)
+            if frame_list:
+                prefetcher = FramePrefetcher(video_path, self._detector, rois, fps,
+                                             num_workers=max(2, self.skip_frames))
+                prefetcher.start()
+                for fn in frame_list:
+                    prefetcher.submit(fn)
 
-                if result.detected:
-                    detections.append(result)
-                    if detected_cb:
-                        detected_cb(result.timestamp,
-                                    result.match_result.raw_text if result.match_result else "")
-                    current_time += self.post_detect_skip_sec
-                else:
-                    current_time += self.interval_sec
+                while True:
+                    item = prefetcher.next_result()
+                    if item is None:
+                        break
+                    fn, prepped_rois, timestamp, has_text = item
+                    if not has_text or not prepped_rois:
+                        continue
+                    if cancel_check and cancel_check():
+                        break
+                    frame_matched = self._match_prepped(prepped_rois, rois, timestamp, fn, raw_ocr_cb)
+                    if frame_matched:
+                        stack.push(SignalEvent(
+                            timestamp=timestamp,
+                            action=frame_matched.action,
+                            actor=frame_matched.actor,
+                            pattern_id=frame_matched.pattern_id,
+                            raw_text=frame_matched.raw_text,
+                            source="text",
+                        ))
+                        if detected_cb:
+                            detected_cb(timestamp, frame_matched.raw_text)
 
-                if progress_cb:
-                    pct = (current_time - start_sec) / (end_sec - start_sec) * 100
-                    progress_cb(min(pct, 100.0))
+                    if progress_cb:
+                        pct = (fn / fps - start_sec) / (end_sec - start_sec) * 100
+                        progress_cb(min(pct, 100.0))
+
+                prefetcher.stop()
+                del prefetcher
         else:
+            frame_list = []
             fn = start_frame
             while fn <= end and not (cancel_check and cancel_check()):
-                try:
-                    frame = player.seek(fn)
-                except Exception:
-                    fn += 1
-                    continue
-
-                result = self.process_frame(frame, rois, fps, fn)
-
-                if result.detected:
-                    detections.append(result)
-                    if detected_cb:
-                        detected_cb(result.timestamp,
-                                    result.match_result.raw_text if result.match_result else "")
-                    fn += max(1, int(fps * self.post_detect_skip_sec))
-                else:
-                    fn += self.skip_frames
-
+                frame_list.append(fn)
+                fn += self.skip_frames
                 if progress_cb:
                     pct = (fn - start_frame) / (end - start_frame) * 100
                     progress_cb(min(pct, 100.0))
 
+            if frame_list:
+                prefetcher = FramePrefetcher(video_path, self._detector, rois, fps,
+                                             num_workers=max(2, self.skip_frames))
+                prefetcher.start()
+                for fn in frame_list:
+                    prefetcher.submit(fn)
+
+                while True:
+                    item = prefetcher.next_result()
+                    if item is None:
+                        break
+                    fn, prepped_rois, timestamp, has_text = item
+                    if not has_text or not prepped_rois:
+                        continue
+                    if cancel_check and cancel_check():
+                        break
+                    frame_matched = self._match_prepped(prepped_rois, rois, timestamp, fn, raw_ocr_cb)
+                    if frame_matched:
+                        stack.push(SignalEvent(
+                            timestamp=timestamp,
+                            action=frame_matched.action,
+                            actor=frame_matched.actor,
+                            pattern_id=frame_matched.pattern_id,
+                            raw_text=frame_matched.raw_text,
+                            source="text",
+                        ))
+                        if detected_cb:
+                            detected_cb(timestamp, frame_matched.raw_text)
+
+                prefetcher.stop()
+                del prefetcher
+
         player.close()
-        return self._merge_detections(detections)
+        results = stack.flush()
+        results = self._merge_overlapping(results)
+        self._build_summary(stack, results, time.time() - _run_start)
+        return results, self._report
 
-    @staticmethod
-    def _best_meta(detections: list[FrameResult]) -> tuple[str, str, str]:
-        """从一组检测帧中选出最佳元数据：优先淘汰 > 击倒，取最高频次"""
-        score: dict[str, tuple[int, str, str, str]] = {}  # key → (count, action, actor, id)
-        for d in detections:
-            if d.match_result is None:
-                continue
-            action = d.match_result.action
-            key = f"{d.match_result.actor}|{action}"
-            if key not in score:
-                score[key] = (0, action, d.match_result.actor, d.match_result.pattern_id)
-            score[key] = (score[key][0] + 1, score[key][1], score[key][2], score[key][3])
-        priority_order = ["淘汰", "击倒"]
-        best = sorted(score.values(), key=lambda x: (
-            0 if x[1] in priority_order else 99 - priority_order.index(x[1]) if x[1] in priority_order else 0,
-            x[0]
-        ), reverse=True)
-        if best:
-            return best[0][1], best[0][2], best[0][3]  # action, actor, pattern_id
-        return "", "", ""
-
-    def _merge_detections(self, detections: list[FrameResult]) -> list[DetectionResult]:
-        if not detections:
-            return []
-        # 每帧分组合并
-        groups: list[list[FrameResult]] = []
-        sorted_d = sorted(detections, key=lambda d: d.timestamp)
-        groups.append([sorted_d[0]])
-        for d in sorted_d[1:]:
-            last = groups[-1][-1]
-            if d.timestamp - last.timestamp <= self.padding_before + self.padding_after + self.merge_gap:
-                groups[-1].append(d)
-            else:
-                groups.append([d])
-        results: list[DetectionResult] = []
-        for g in groups:
-            action, actor, pid = self._best_meta(g)
-            results.append(DetectionResult(
-                start_sec=max(0.0, g[0].timestamp - self.padding_before),
-                end_sec=g[-1].timestamp + self.padding_after,
-                action=action, actor=actor, pattern_id=pid,
-                match_count=len(g),
-            ))
-        return results
+    def _build_summary(self, stack: EventStackEngine, merged: list, elapsed: float):
+        if self._report is None:
+            return
+        s = self._report.summary
+        s.elapsed_seconds = elapsed
+        s.detections_before_merge = stack.total_pushed
+        s.detections_after_merge = len(merged)
+        s.counter_total_events = len(self._counter.events)
+        s.counter_total_delta = sum(d for _, d in self._counter.events)
+        hit_frames: set[int] = set()
+        match_frames: set[int] = set()
+        drop_counts: dict[str, int] = {}
+        for fl in self._report.frames_log:
+            s.total_frames = max(s.total_frames, fl.frame_number + 1)
+            if fl.ocr_text:
+                hit_frames.add(fl.frame_number)
+            if fl.match_hit:
+                match_frames.add(fl.frame_number)
+            if fl.dropped and fl.drop_reason:
+                drop_counts[fl.drop_reason] = drop_counts.get(fl.drop_reason, 0) + 1
+        s.frames_with_ocr_hits = len(hit_frames)
+        s.frames_with_matches = len(match_frames)
+        s.dropped_total = sum(drop_counts.values())
+        s.dropped_by_reason = drop_counts
+        self._report.results = [
+            {"start_sec": r.start_sec, "end_sec": r.end_sec,
+             "action": r.action, "actor": r.actor,
+             "pattern_id": r.pattern_id, "source": r.source}
+            for r in merged
+        ]
 
     @staticmethod
     def merge_time_ranges(ranges: list[TimeRange], max_gap: float = 30.0) -> list[TimeRange]:
@@ -284,6 +1099,30 @@ class DetectionEngine:
             last = merged[-1]
             if r.start_sec - last.end_sec <= max_gap:
                 merged[-1] = TimeRange(last.start_sec, max(last.end_sec, r.end_sec))
+            else:
+                merged.append(r)
+        return merged
+
+    @staticmethod
+    def _merge_overlapping(results: list[DetectionResult]) -> list[DetectionResult]:
+        """合并时间重叠的片段，消除导出时的重复画面。"""
+        if len(results) <= 1:
+            return results
+        sorted_r = sorted(results, key=lambda r: r.start_sec)
+        merged: list[DetectionResult] = [sorted_r[0]]
+        for r in sorted_r[1:]:
+            last = merged[-1]
+            if r.start_sec <= last.end_sec:
+                # 重叠：扩展结束时间，合并标签
+                merged[-1] = DetectionResult(
+                    start_sec=last.start_sec,
+                    end_sec=max(last.end_sec, r.end_sec),
+                    action=f"{last.action}+{r.action}" if r.action != last.action else last.action,
+                    actor=f"{last.actor}+{r.actor}" if r.actor != last.actor else last.actor,
+                    pattern_id=f"{last.pattern_id}+{r.pattern_id}" if r.pattern_id != last.pattern_id else last.pattern_id,
+                    match_count=last.match_count + r.match_count,
+                    source="merged" if last.source != r.source else last.source,
+                )
             else:
                 merged.append(r)
         return merged

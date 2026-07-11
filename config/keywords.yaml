@@ -11,6 +11,7 @@ trigger_prefixes:
   - "你使用"
   - "你的队友"
   - "你被"
+  - "你引爆"
 
 rules:
   # === 自己击杀 ===
@@ -43,6 +44,28 @@ rules:
     actor: "敌人"
     actor_signal: "你的队友"
     require_signal: "被"
+    action: "击倒"
+
+  # === 自己载具击杀 ===
+  - id: kill_self_vehicle
+    actor: "自己"
+    actor_signal: "你引爆"
+    action: "淘汰"
+
+  - id: knockdown_self_vehicle
+    actor: "自己"
+    actor_signal: "你引爆"
+    action: "击倒"
+
+  # === 自己被淘汰 ===
+  - id: killed_self
+    actor: "敌人"
+    actor_signal: "你被"
+    action: "淘汰"
+
+  - id: knocked_self
+    actor: "敌人"
+    actor_signal: "你被"
     action: "击倒"
 
   # === 队友击杀（anti_signal 排除"被"） ===
