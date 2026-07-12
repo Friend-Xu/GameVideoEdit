@@ -51,11 +51,14 @@ def verify_environment() -> list[str]:
 def main() -> int:
     _setup_path(); _setup_env()
 
+    from app.utils.logger import setup
+    setup(Path(__file__).resolve().parent.parent)
+
+    import logging
     issues = verify_environment()
     if issues:
-        print("[环境警告]")
         for i in issues:
-            print(f"  - {i}")
+            logging.getLogger("env").warning(i)
 
     from PySide6.QtWidgets import QApplication
     from app.ui.main_window import MainWindow

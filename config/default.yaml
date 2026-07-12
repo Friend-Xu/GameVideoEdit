@@ -12,13 +12,29 @@ ocr:
 detection:
   mode: time
   interval_sec: 1.0
-  skip_frames: 3
+  skip_frames: 100
   post_detect_skip_sec: 0.3
-  padding_before: 5
-  padding_after: 5
+  padding_before: 5.0
+  padding_after: 5.0
   merge_gap: 30.0
-  num_threads: 4
+  num_threads: 1
   rotation: 0
+  pipeline_mode: pool
+  cpu_workers: 6
+  gpu_workers: 4
+  refine_boundaries: false
+  refine_search_window: 2.0
+  cell_divide: false
+  cell_min_gap: 2.0
+event_stack:
+  wait_after:
+    淘汰: 10.0
+    击倒: 30.0
+    counter: 10.0
+    淘汰:队友: 3.0
+    击倒:队友: 3.0
+    淘汰:敌人: 5.0
+    击倒:敌人: 5.0
 export:
   ffmpeg_path: ffmpeg
   default_encoder: auto

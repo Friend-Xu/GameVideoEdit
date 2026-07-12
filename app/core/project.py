@@ -39,17 +39,25 @@ class VideoSource:
 @dataclass
 class DetectionConfig:
     """OCR 识别参数"""
-    mode: str = "time"
+    mode: str = "frame"
     interval_sec: float = 1.0
-    skip_frames: int = 3
+    skip_frames: int = 15
     post_detect_skip_sec: float = 0.3
-    padding_before: float = 10.0
-    padding_after: float = 10.0
+    padding_before: float = 5.0
+    padding_after: float = 5.0
     merge_gap: float = 30.0
     num_threads: int = 4
     gpu: bool = True
     rotation: int = 0
     allowed_actors: set[str] | None = None
+    pipeline_mode: str = "pool"
+    cpu_workers: int = 6
+    gpu_workers: int = 4
+    # 后处理参数（所有 pipeline_mode 通用）
+    refine_boundaries: bool = False
+    refine_search_window: float = 2.0
+    cell_divide: bool = False
+    cell_min_gap: float = 2.0
 
     def to_worker_kwargs(self) -> dict:
         return {
@@ -73,6 +81,7 @@ class ClipResult:
     action: str = ""
     actor: str = ""
     raw_text: str = ""
+    source: str = "text"
 
     @property
     def duration(self) -> float:
@@ -211,7 +220,9 @@ class Project:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 src = data.get("source", {})
-                if src.get("path") == self.source.path:
+                src_path = os.path.abspath(src.get("path", ""))
+                my_path = os.path.abspath(self.source.path)
+                if src_path == my_path:
                     self.results.clear()
                     for r in data.get("results", []):
                         self.results.append(ClipResult(
@@ -219,6 +230,7 @@ class Project:
                             pattern_id=r.get("pattern_id", ""),
                             action=r.get("action", ""), actor=r.get("actor", ""),
                             raw_text=r.get("raw_text", ""),
+                            source=r.get("source", "text"),
                         ))
                     self.last_detection = data.get("last_detection", "")
                     det = data.get("detection", {})
@@ -226,12 +238,15 @@ class Project:
                         cfg = self.detection
                         for k in ("mode", "interval_sec", "skip_frames",
                                    "post_detect_skip_sec", "padding_before",
-                                   "padding_after", "merge_gap", "num_threads"):
+                                   "padding_after", "merge_gap", "num_threads",
+                                   "rotation"):
                             if k in det:
                                 setattr(cfg, k, det[k])
+                        if "allowed_actors" in det and det["allowed_actors"]:
+                            cfg.allowed_actors = set(det["allowed_actors"])
                     exp = data.get("export", {})
                     if exp:
-                        for k in ("output_path", "quality", "preset", "use_gpu"):
+                        for k in ("output_path", "ffmpeg_path", "quality", "preset", "use_gpu"):
                             if k in exp:
                                 setattr(self.export, k, exp[k])
                     return True
@@ -342,6 +357,9 @@ class Project:
                 "padding_after": self.detection.padding_after,
                 "merge_gap": self.detection.merge_gap,
                 "num_threads": self.detection.num_threads,
+                "rotation": self.detection.rotation,
+                "allowed_actors": (sorted(self.detection.allowed_actors)
+                                   if self.detection.allowed_actors else None),
             },
             "results": [
                 {
@@ -351,11 +369,13 @@ class Project:
                     "action": r.action,
                     "actor": r.actor,
                     "raw_text": r.raw_text,
+                    "source": r.source,
                 }
                 for r in self.results
             ],
             "export": {
                 "output_path": self.export.output_path,
+                "ffmpeg_path": self.export.ffmpeg_path,
                 "quality": self.export.quality,
                 "preset": self.export.preset,
                 "use_gpu": self.export.use_gpu,
@@ -384,19 +404,23 @@ class Project:
             cfg = proj.detection
             for k in ("mode", "interval_sec", "skip_frames",
                        "post_detect_skip_sec", "padding_before",
-                       "padding_after", "merge_gap", "num_threads"):
+                       "padding_after", "merge_gap", "num_threads",
+                       "rotation"):
                 if k in det:
                     setattr(cfg, k, det[k])
+            if "allowed_actors" in det and det["allowed_actors"]:
+                cfg.allowed_actors = set(det["allowed_actors"])
         for r in data.get("results", []):
             proj.results.append(ClipResult(
                 start_sec=r["start_sec"], end_sec=r["end_sec"],
                 pattern_id=r.get("pattern_id", ""),
                 action=r.get("action", ""), actor=r.get("actor", ""),
                 raw_text=r.get("raw_text", ""),
+                source=r.get("source", "text"),
             ))
         exp = data.get("export", {})
         if exp:
-            for k in ("output_path", "quality", "preset", "use_gpu"):
+            for k in ("output_path", "ffmpeg_path", "quality", "preset", "use_gpu"):
                 if k in exp:
                     setattr(proj.export, k, exp[k])
         proj.last_detection = data.get("last_detection", "")

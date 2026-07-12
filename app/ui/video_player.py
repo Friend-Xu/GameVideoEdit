@@ -7,29 +7,13 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSizePolicy,
-    QSlider, QStyle, QStyleOptionSlider, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from app.core.player import VideoPlayer as CorePlayer
-from app.core.project import Project
+from app.core.project import ClipResult, Project
 from app.ui.overlay import OverlayWidget
-
-
-class VideoSlider(QSlider):
-    sliderClicked = Signal(int)
-
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-        if event.button() == Qt.LeftButton:
-            opt = QStyleOptionSlider()
-            self.initStyleOption(opt)
-            rect = self.style().subControlRect(
-                QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
-            pos = event.position().toPoint().x() - rect.x()
-            value = round(self.minimum() + (self.maximum() - self.minimum())
-                          * (pos / rect.width()))
-            self.setValue(value)
-            self.sliderClicked.emit(value)
+from app.ui.timeline import TimelineWidget
 
 
 class VideoPlayerWidget(QWidget):
@@ -83,11 +67,9 @@ class VideoPlayerWidget(QWidget):
         self._overlay = OverlayWidget(self._video_label)
         layout.addWidget(self._video_container, 1)
 
-        self._slider = VideoSlider(Qt.Horizontal)
-        self._slider.setRange(0, 100)
-        self._slider.sliderMoved.connect(self._set_position)
-        self._slider.sliderClicked.connect(self._set_position)
-        layout.addWidget(self._slider)
+        self._timeline = TimelineWidget()
+        self._timeline.seekRequested.connect(self.seek_to_second)
+        layout.addWidget(self._timeline)
 
         ctrl = QHBoxLayout()
         ctrl.setSpacing(5)
@@ -140,7 +122,8 @@ class VideoPlayerWidget(QWidget):
         self._region_counter = 0
         self._overlay.set_video_size(self._original_size)
         self._overlay.set_regions([])
-        self._slider.setValue(0)
+        self._timeline.set_duration(info.total_frames / info.fps)
+        self._timeline.set_position(0.0)
         self._play_btn.setText("播放")
         self._timer_interval = max(16, int(1000 / info.fps))
         self._timer.setInterval(self._timer_interval)
@@ -177,9 +160,8 @@ class VideoPlayerWidget(QWidget):
             return
         self._display_frame(frame)
         if self._player.video_info:
-            self._slider.setValue(int(
-                self._player.current_frame /
-                self._player.video_info.total_frames * 100))
+            self._timeline.set_position(
+                self._player.current_frame / self._player.video_info.fps)
 
     def seek_to_second(self, second: float):
         if not self._player.is_open or not self._player.video_info:
@@ -194,20 +176,6 @@ class VideoPlayerWidget(QWidget):
         except Exception:
             pass
 
-    def _set_position(self, pos: int):
-        if not self._player.is_open or not self._player.video_info:
-            return
-        self._timer.stop()
-        self._audio_player.pause()
-        self._play_btn.setText("播放")
-        target = int(pos / 100.0 * self._player.video_info.total_frames)
-        second = target / self._player.video_info.fps
-        self._audio_player.setPosition(int(second * 1000))
-        try:
-            self._display_frame(self._player.seek_rgb(target))
-        except Exception:
-            pass
-
     def _prev_frame(self):
         self._timer.stop()
         self._audio_player.pause()
@@ -216,6 +184,9 @@ class VideoPlayerWidget(QWidget):
             try:
                 self._display_frame(
                     self._player.seek_rgb(max(0, self._player.current_frame - 1)))
+                if self._player.video_info:
+                    self._timeline.set_position(
+                        self._player.current_frame / self._player.video_info.fps)
             except Exception:
                 pass
 
@@ -226,6 +197,10 @@ class VideoPlayerWidget(QWidget):
         f = self._player.next_frame_rgb()
         if f is not None:
             self._display_frame(f)
+            if self._player.video_info:
+                self._slider.setValue(int(
+                    self._player.current_frame /
+                    self._player.video_info.total_frames * 100))
 
     def _rotate(self):
         self._rotation = (self._rotation + 90) % 360
@@ -397,3 +372,21 @@ class VideoPlayerWidget(QWidget):
             "fps": info.fps, "total_frames": info.total_frames,
             "rotation": self._rotation, "regions": yolo,
         }
+
+    # ── 时间轴 ─────────────────────────────────────────────
+
+    def update_timeline_clips(self, clips: list[ClipResult]):
+        """同步检测结果到时间轴片段标记"""
+        self._timeline.set_clips([
+            {"start": c.start_sec, "end": c.end_sec,
+             "actor": c.actor, "action": c.action, "pid": c.pattern_id}
+            for c in clips
+        ])
+
+    def select_timeline_clip(self, idx: int):
+        """选中时间轴上的片段（从结果列表联动）"""
+        self._timeline.select_clip(idx)
+
+    @property
+    def timeline(self) -> TimelineWidget:
+        return self._timeline

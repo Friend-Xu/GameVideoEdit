@@ -1,10 +1,11 @@
 """主窗口 —— 集成视频播放器、OCR、导出。"""
 
 import json
+import logging
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QSettings, QTimer
+from PySide6.QtCore import QEvent, Qt, QSettings, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -18,12 +19,16 @@ from app.core.keywords import KeywordMatcher
 from app.core.project import Project, ClipResult
 from app.ui.video_player import VideoPlayerWidget
 from app.ui.side_panel import SidePanelWidget
+from app.ui.settings_dialog import SettingsDialog
 from app.workers.ocr_worker import OCRWorker
 from app.workers.export_worker import ExportWorker
 
 
 class MainWindow(QMainWindow):
     """应用主窗口 —— 药药的剪辑工具"""
+
+    log = Signal(str, int)
+    _log = logging.getLogger("app.ui.main_window")
 
     def __init__(self):
         super().__init__()
@@ -33,11 +38,14 @@ class MainWindow(QMainWindow):
         self._project = Project()
         self._ocr_threads: list[OCRWorker] = []
         self._thread_results: dict[int, list] = {}
+        self._thread_reports: dict[int, object] = {}
         self._completed = 0
         self._ocr_detecting = False
         self._detect_hit_count = 0
         self._worker: ExportWorker | None = None
         self._setup_ui(); self._apply_theme()
+        from app.utils.logger import attach_qt_bridge
+        attach_qt_bridge(self.log)
         QApplication.instance().installEventFilter(self)
         QTimer.singleShot(100, self._load_matcher)
 
@@ -51,8 +59,9 @@ class MainWindow(QMainWindow):
         btn_open.clicked.connect(self._open_video); tl.addWidget(btn_open)
         title = QLabel("药药的剪辑工具"); title.setObjectName("titleLabel")
         tl.addWidget(title); tl.addStretch()
-        self._params_btn = QPushButton("识别参数 ▾"); self._params_btn.clicked.connect(self._toggle_params)
-        tl.addWidget(self._params_btn)
+        self._settings_btn = QPushButton("⚙ 设置")
+        self._settings_btn.clicked.connect(self._open_settings)
+        tl.addWidget(self._settings_btn)
         self._detect_btn = QPushButton("开始识别"); self._detect_btn.setStyleSheet(
             "QPushButton { background-color: #9C27B0; color: white; font-weight: bold; "
             "border-radius: 5px; padding: 8px 18px; } QPushButton:hover { background-color: #7B1FA2; }"
@@ -62,10 +71,6 @@ class MainWindow(QMainWindow):
         self._theme_btn = QPushButton("深色模式"); self._theme_btn.setProperty("cssClass", "primary")
         self._theme_btn.clicked.connect(self._toggle_theme); tl.addWidget(self._theme_btn)
         ml.addLayout(tl)
-
-        # ---- 可折叠参数面板（弹出浮层） ----
-        self._params_panel = self._create_params_panel()
-        self._params_panel.setVisible(False)
 
         # ---- 中央分栏 ----
         splitter = QSplitter(Qt.Horizontal)
@@ -79,6 +84,7 @@ class MainWindow(QMainWindow):
         self._player.set_project(self._project)
         self._player.setMinimumWidth(320)
         self._player.frame_changed.connect(self._on_frame_changed)
+        self._player.timeline.clipSelected.connect(self._on_timeline_clip_selected)
         splitter.addWidget(self._player)
 
         # 右侧: 结果画廊 + 导出
@@ -94,6 +100,7 @@ class MainWindow(QMainWindow):
         self._result_list = QListWidget()
         self._result_list.itemDoubleClicked.connect(self._on_result_double_clicked)
         self._result_list.itemChanged.connect(lambda: self._update_export_buttons())
+        self._result_list.currentRowChanged.connect(self._player.select_timeline_clip)
         rl.addWidget(self._result_list, 1)
 
         # undo / redo
@@ -129,12 +136,23 @@ class MainWindow(QMainWindow):
         btn_path = QPushButton("另存为")
         btn_path.clicked.connect(self._choose_export_path); pline.addWidget(btn_path)
         rl.addLayout(pline)
+
+        # 日志区域
+        self._log_view = QTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.document().setMaximumBlockCount(2000)
+        self._log_view.setMinimumHeight(60)
+        self._log_view.setPlaceholderText("检测日志...")
+        self.log.connect(self._append_log)
+        rl.addWidget(self._log_view, 1)
+
         splitter.addWidget(right); splitter.setSizes([340, 640, 320])
         for i in range(3):
             splitter.setCollapsible(i, False)
         ml.addWidget(splitter, 1)
         self.statusBar().showMessage("就绪")
         self._wire_side_panel()
+        self._init_detection_config()
 
     def _build_filter_bar(self) -> QWidget:
         w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(4)
@@ -236,25 +254,8 @@ class MainWindow(QMainWindow):
         if qss_file.exists():
             with open(qss_file, "r", encoding="utf-8") as f: self.setStyleSheet(f.read())
         self._theme_btn.setText("浅色模式" if self._dark else "深色模式")
-        self._update_params_popup_style()
 
-    def _update_params_popup_style(self):
-        if self._dark:
-            self._params_panel.setStyleSheet(
-                "#paramsPopup { background: #2D2D2D; border: 2px solid #555; "
-                "border-radius: 8px; padding: 10px; } "
-                "#paramsPopup QLabel { color: #DDD; } "
-                "#paramsPopup QComboBox { background: #3D3D3D; color: #DDD; "
-                "border: 1px solid #555; border-radius: 3px; padding: 3px; } "
-                "#paramsPopup QSpinBox, #paramsPopup QDoubleSpinBox { "
-                "background: #3D3D3D; color: #DDD; border: 1px solid #555; "
-                "border-radius: 3px; padding: 3px; }")
-        else:
-            self._params_panel.setStyleSheet(
-                "#paramsPopup { background: #FFFFFF; border: 2px solid #3a7ca5; "
-                "border-radius: 8px; padding: 10px; }")
-
-    # ---- 参数面板 ----
+    # ---- 参数加载 & 设置 ----
 
     def _load_detection_defaults(self) -> dict:
         import yaml
@@ -269,10 +270,9 @@ class MainWindow(QMainWindow):
                 pass
         return {}
 
-    def _create_params_panel(self) -> QWidget:
+    def _init_detection_config(self):
+        """从 default.yaml 加载检测配置到 Project.detection"""
         d = self._load_detection_defaults()
-
-        # 直接设置 Project 默认值
         det = self._project.detection
         det.mode = d.get("mode", "time")
         det.interval_sec = float(d.get("interval_sec", 1.0))
@@ -283,113 +283,20 @@ class MainWindow(QMainWindow):
         det.merge_gap = float(d.get("merge_gap", 30.0))
         det.num_threads = int(d.get("num_threads", 4))
         det.rotation = int(d.get("rotation", 0))
+        det.pipeline_mode = d.get("pipeline_mode", "legacy")
+        det.cpu_workers = int(d.get("cpu_workers", 3))
+        det.gpu_workers = int(d.get("gpu_workers", 2))
+        det.refine_boundaries = bool(d.get("refine_boundaries", False))
+        det.refine_search_window = float(d.get("refine_search_window", 2.0))
+        det.cell_divide = bool(d.get("cell_divide", False))
+        det.cell_min_gap = float(d.get("cell_min_gap", 2.0))
 
-        w = QWidget()
-        w.setWindowFlags(Qt.Popup)
-        w.setObjectName("paramsPopup")
-        gv = QVBoxLayout(w); gv.setContentsMargins(10, 10, 10, 10)
+    def _open_settings(self):
+        dlg = SettingsDialog(self._project.detection, self._dark, self)
+        if dlg.exec() == SettingsDialog.Accepted:
+            self.statusBar().showMessage("设置已保存", 3000)
 
-        pl = QHBoxLayout()
-        pl.addWidget(QLabel("预留时间(秒):"))
-        self._padding = QSpinBox(); self._padding.setRange(1, 30); self._padding.setValue(int(det.padding_before))
-        self._padding.valueChanged.connect(
-            lambda v: setattr(self._project.detection, 'padding_before', v) or
-            setattr(self._project.detection, 'padding_after', v))
-        pl.addWidget(self._padding)
-        pl.addWidget(QLabel("线程数:"))
-        self._threads_spin = QSpinBox(); self._threads_spin.setRange(1, 16)
-        self._threads_spin.setValue(det.num_threads)
-        self._threads_spin.valueChanged.connect(
-            lambda v: setattr(self._project.detection, 'num_threads', v))
-        pl.addWidget(self._threads_spin)
-        pl.addWidget(QLabel("旋转:"))
-        self._rot_combo = QComboBox()
-        self._rot_combo.addItems(["0°", "90°", "180°", "270°"])
-        self._rot_combo.setCurrentIndex(det.rotation // 90)
-        self._rot_combo.currentIndexChanged.connect(
-            lambda i: setattr(self._project.detection, 'rotation', i * 90))
-        pl.addWidget(self._rot_combo); pl.addStretch(); gv.addLayout(pl)
-
-        pl2 = QHBoxLayout()
-        pl2.addWidget(QLabel("OCR模式:"))
-        is_time = det.mode == "time"
-        self._mode_combo = QComboBox(); self._mode_combo.addItems(["时间间隔", "帧间隔"])
-        self._mode_combo.setCurrentIndex(0 if is_time else 1)
-        self._mode_combo.currentIndexChanged.connect(self._on_ocr_mode_changed)
-        pl2.addWidget(self._mode_combo)
-        pl2.addWidget(QLabel("采样间隔:"))
-        self._interval_spin = QDoubleSpinBox(); self._interval_spin.setRange(0.1, 10.0)
-        self._interval_spin.setValue(det.interval_sec)
-        self._interval_spin.setSingleStep(0.1); self._interval_spin.setDecimals(1)
-        self._interval_spin.valueChanged.connect(
-            lambda v: setattr(self._project.detection, 'interval_sec', v))
-        pl2.addWidget(self._interval_spin); self._interval_unit = QLabel("秒"); pl2.addWidget(self._interval_unit)
-        self._skip_spin = QSpinBox(); self._skip_spin.setRange(1, 30)
-        self._skip_spin.setValue(det.skip_frames)
-        self._skip_spin.setVisible(not is_time)
-        self._skip_spin.valueChanged.connect(
-            lambda v: setattr(self._project.detection, 'skip_frames', v))
-        pl2.addWidget(self._skip_spin)
-        pl2.addWidget(QLabel("命中跳秒:"))
-        self._post_detect = QDoubleSpinBox()
-        self._post_detect.setRange(0.1, 5.0)
-        self._post_detect.setValue(det.post_detect_skip_sec)
-        self._post_detect.setSingleStep(0.1); self._post_detect.setDecimals(1)
-        self._post_detect.valueChanged.connect(
-            lambda v: setattr(self._project.detection, 'post_detect_skip_sec', v))
-        pl2.addWidget(self._post_detect); pl2.addWidget(QLabel("秒"))
-        pl2.addStretch()
-        gv.addLayout(pl2)
-
-        save_btn = QPushButton("保存为默认值")
-        save_btn.clicked.connect(self._save_detection_defaults)
-        gv.addWidget(save_btn)
-
-        return w
-
-    def _save_detection_defaults(self):
-        import yaml
-        from app.utils.paths import config_dir
-        yaml_path = config_dir() / "default.yaml"
-        cfg = {}
-        if yaml_path.exists():
-            try:
-                with open(yaml_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-            except Exception:
-                pass
-        cfg["detection"] = {
-            "mode": self._project.detection.mode,
-            "interval_sec": self._project.detection.interval_sec,
-            "skip_frames": self._project.detection.skip_frames,
-            "post_detect_skip_sec": self._project.detection.post_detect_skip_sec,
-            "padding_before": self._project.detection.padding_before,
-            "padding_after": self._project.detection.padding_after,
-            "merge_gap": self._project.detection.merge_gap,
-            "num_threads": self._project.detection.num_threads,
-            "rotation": self._project.detection.rotation,
-        }
-        with open(yaml_path, "w", encoding="utf-8") as f:
-            yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-        self.statusBar().showMessage("检测参数已保存为默认值", 3000)
-
-    def _toggle_params(self):
-        if self._params_panel.isVisible():
-            self._params_panel.hide()
-            self._params_btn.setText("识别参数 ▾")
-        else:
-            btn = self._params_btn
-            pos = btn.mapToGlobal(btn.rect().bottomLeft())
-            self._params_panel.move(pos)
-            self._params_panel.show()
-            self._params_btn.setText("识别参数 ▴")
-
-    def _on_ocr_mode_changed(self, index):
-        is_time = index == 0
-        self._project.detection.mode = "time" if is_time else "frame"
-        self._interval_spin.setVisible(is_time)
-        self._interval_unit.setVisible(is_time)
-        self._skip_spin.setVisible(not is_time)
+    # ---- OCR 识别 ----
 
     # ---- OCR 识别 ----
 
@@ -400,13 +307,25 @@ class MainWindow(QMainWindow):
             self._start_detection()
 
     def _start_detection(self):
+        self._log.debug("_start_detection 入口")
         if not self._project.source.path or not self._matcher:
+            self._log.warning("_start_detection 退出: source.path=%s, matcher=%s",
+                             self._project.source.path, self._matcher)
             return
+        ann = self._project.annotations
+        if ann.region_count == 0:
+            self._project._auto_load_roi()
+        if ann.region_count == 0:
+            QMessageBox.warning(self, "缺少 ROI", "请先在侧边栏设置 ROI 检测区域（击杀信息等）")
+            self._log.warning("_start_detection 退出: 无 ROI")
+            return
+        self._project.auto_save_roi()
+        self._log.info("检测开始: %d 个 ROI 区域", ann.region_count)
         self._ocr_detecting = True
         self._detect_btn.setText("取消识别")
         self._export_selected_btn.setEnabled(False)
         self._export_all_btn.setEnabled(False)
-        self._result_list.clear(); self._thread_results.clear(); self._completed = 0
+        self._result_list.clear(); self._thread_results.clear(); self._thread_reports.clear(); self._completed = 0
         self._ocr_threads.clear()
         self._detect_hit_count = 0
         self._result_label.setText("识别进度")
@@ -418,12 +337,15 @@ class MainWindow(QMainWindow):
             b.deleteLater()
         self._thread_bars.clear()
 
-        from app.core.detector import OCRDetector
+        from app.core.detector import OCRDetector, DetectionPipeline
         try:
+            self._log.debug("加载 OCRDetector...")
             detector = OCRDetector(gpu=True)
             import numpy as np
             detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
+            self._log.debug("OCRDetector 加载完成")
         except Exception as e:
+            self._log.error("模型加载失败: %s", e)
             QMessageBox.critical(self, "模型加载失败", str(e))
             self._reset_detect_state()
             return
@@ -433,6 +355,7 @@ class MainWindow(QMainWindow):
         try:
             info = player.open(self._project.source.path)
         except Exception as e:
+            self._log.error("打开视频失败: %s", e)
             QMessageBox.critical(self, "错误", str(e))
             self._reset_detect_state()
             return
@@ -440,31 +363,149 @@ class MainWindow(QMainWindow):
             player.close()
 
         total = info.total_frames; n_threads = self._project.detection.num_threads
-        fps = info.fps; frames_per = total // n_threads
+        fps = info.fps
+        pipeline_mode = getattr(self._project.detection, 'pipeline_mode', 'legacy')
+        self._log.debug("视频: %s, %dx%d, %.2ffps, %d frames, 模式=%s, 线程=%d",
+                        self._project.source.path, info.width, info.height,
+                        fps, total, pipeline_mode, n_threads)
 
-        for i in range(n_threads):
-            sf = i * frames_per
-            ef = (i + 1) * frames_per - 1 if i < n_threads - 1 else total - 1
-            worker = OCRWorker(
-                i, self._project.source.path, self._project.annotations,
-                self._matcher, **self._project.detection.to_worker_kwargs(),
-                start_frame=sf, end_frame=ef,
+        bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0); bar.setFixedHeight(18)
+        self._thread_bars.append(bar)
+        self._thread_container.addWidget(bar)
+
+        if pipeline_mode == "pool":
+            self._log.debug("进入 pool 模式")
+            bar.setFormat("Pool 模式: %p%")
+            self._run_detection_pipeline(detector, info, bar)
+        else:
+            bar.setFormat("线程 1: %p%")
+            from app.workers.ocr_worker import OCRWorker
+            frames_per = total // n_threads
+            for i in range(n_threads):
+                sf = i * frames_per
+                ef = (i + 1) * frames_per - 1 if i < n_threads - 1 else total - 1
+                worker = OCRWorker(
+                    i, self._project.source.path, self._project.annotations,
+                    self._matcher, **self._project.detection.to_worker_kwargs(),
+                    start_frame=sf, end_frame=ef,
+                )
+                worker.progress.connect(self._on_ocr_progress)
+                worker.detected.connect(self._on_ocr_detected)
+                worker.raw_text.connect(self._on_raw_ocr_text)
+                worker.error.connect(self._on_ocr_error)
+                worker.finished.connect(self._on_ocr_thread_done)
+                self._ocr_threads.append(worker)
+                if i > 0:
+                    b2 = QProgressBar(); b2.setRange(0, 100); b2.setValue(0); b2.setFixedHeight(18)
+                    b2.setFormat(f"线程 {i + 1}: %p%")
+                    self._thread_bars.append(b2)
+                    self._thread_container.addWidget(b2)
+            self.statusBar().showMessage(f"启动 {n_threads} 个识别线程...")
+            for w in self._ocr_threads:
+                w.start()
+
+    def _run_detection_pipeline(self, detector, info, bar):
+        """在主线程直接运行 DetectionPipeline（避免子线程 OCR 失效）。"""
+        self._log.debug("_run_detection_pipeline 入口")
+        from app.core.detector import DetectionPipeline
+        from PySide6.QtWidgets import QApplication
+
+        cpu_n = getattr(self._project.detection, 'cpu_workers', 3)
+        gpu_n = getattr(self._project.detection, 'gpu_workers', 2)
+        kwargs = self._project.detection.to_worker_kwargs()
+        self._log.debug("cpu_workers=%d, gpu_workers=%d, skip_frames=%d, mode=%s",
+                        cpu_n, gpu_n, kwargs.get('skip_frames', 0), kwargs.get('mode', '?'))
+
+        pipeline = DetectionPipeline(
+            self._matcher, detector,
+            cpu_workers=cpu_n, gpu_workers=gpu_n,
+            padding_before=kwargs.get('padding_before', 10.0),
+            padding_after=kwargs.get('padding_after', 10.0),
+            allowed_actors=kwargs.get('allowed_actors'),
+            skip_frames=kwargs.get('skip_frames', 3),
+            mode=kwargs.get('mode', 'time'),
+            interval_sec=kwargs.get('interval_sec', 1.0),
+        )
+
+        self._cancel_flag = False
+
+        def prog_cb(pct):
+            bar.setValue(int(pct))
+            QApplication.processEvents()
+
+        def det_cb(ts, text):
+            self._on_ocr_detected(ts, text)
+            QApplication.processEvents()
+
+        self.statusBar().showMessage("启动 Pool 模式识别...")
+        self._log.debug("调用 pipeline.run_full...")
+        try:
+            time_ranges, report = pipeline.run_full(
+                video_path=self._project.source.path,
+                annotations=self._project.annotations,
+                start_frame=0, end_frame=info.total_frames - 1,
+                progress_cb=prog_cb,
+                detected_cb=det_cb,
+                raw_ocr_cb=lambda ts, t, l: self._on_raw_ocr_text(ts, t, l),
+                cancel_check=lambda: self._cancel_flag,
             )
-            worker.progress.connect(self._on_ocr_progress)
-            worker.detected.connect(self._on_ocr_detected)
-            worker.finished.connect(self._on_ocr_thread_done)
-            self._ocr_threads.append(worker)
+        except Exception as e:
+            self._log.error("检测失败: %s", e)
+            import traceback
+            self._log.error(traceback.format_exc())
+            self._reset_detect_state()
+            return
 
-            bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0); bar.setFixedHeight(18)
-            bar.setFormat(f"线程 {i + 1}: %p%")
-            self._thread_bars.append(bar)
-            self._thread_container.addWidget(bar)
+        self._log.debug("pipeline.run_full 返回: %d 个 time_ranges", len(time_ranges))
+        all_clips = []
+        for r in time_ranges:
+            all_clips.append(ClipResult(
+                start_sec=r.start_sec, end_sec=r.end_sec,
+                action=r.action, actor=r.actor,
+                pattern_id=r.pattern_id, source=r.source))
+        self._log.debug("构建 %d 个 ClipResult", len(all_clips))
 
-        self.statusBar().showMessage(f"启动 {n_threads} 个识别线程...")
-        for w in self._ocr_threads:
-            w.start()
+        if self._project.detection.refine_boundaries and all_clips:
+            try:
+                self._log.debug("后处理: 边界精化...")
+                all_clips = self._refine_boundaries(all_clips)
+            except Exception as e:
+                self._log.error("边界精化失败 (跳过): %s", e)
+        if self._project.detection.cell_divide and all_clips:
+            try:
+                self._log.debug("后处理: 细胞分裂...")
+                all_clips = self._cell_divide_events(all_clips)
+            except Exception as e:
+                self._log.error("细胞分裂失败 (跳过): %s", e)
+
+        if all_clips:
+            all_clips.sort(key=lambda c: c.start_sec)
+            self._project.set_results(all_clips)
+            self._log.debug("set_results(%d clips)", len(all_clips))
+
+        if report:
+            self._thread_reports[0] = report
+            self._log.debug("report saved to _thread_reports[0]")
+
+        try:
+            self._log.debug("调用 _save_detection_report...")
+            self._save_detection_report(all_clips)
+            self._log.debug("_save_detection_report 完成")
+        except Exception as e:
+            self._log.error("保存检测报告异常: %s", e)
+
+        self._log.debug("重置 UI 状态...")
+        self._ocr_detecting = False
+        self._detect_btn.setText("开始识别")
+        self._detect_btn.setEnabled(True)
+        self._progress_widget.setVisible(False)
+        self._show_results()
+        self.statusBar().showMessage(
+            f"识别完成! {len(all_clips)} 个高光片段")
+        self._log.info("检测流程完成: %d 个片段", len(all_clips))
 
     def _cancel_detection(self):
+        self._cancel_flag = True
         for w in self._ocr_threads:
             w.cancel()
         self._progress_widget.setVisible(False)
@@ -488,18 +529,126 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"识别中... {done}/{len(self._ocr_threads)} 个线程完成 | 发现 {self._detect_hit_count} 个片段")
 
+    def _append_log(self, msg: str, level: int):
+        colors = {0: "#aaa", 1: "#fa0", 2: "#f55"}
+        color = colors.get(level, "#aaa")
+        self._log_view.append(f"<span style='color:{color}'>{msg}</span>")
+
     def _on_ocr_detected(self, timestamp: float, text: str):
         self._detect_hit_count += 1
         short = text[:25] + "..." if len(text) > 25 else text
         self._detect_count_label.setText(
             f"已检测到: {self._detect_hit_count} | [{timestamp:.1f}s] {short}")
 
-    def _on_ocr_thread_done(self, tid: int, ranges: list):
+    def _on_raw_ocr_text(self, timestamp: float, text: str, label: str):
+        if not text or not text.strip():
+            return
+        ts = int(timestamp)
+        short = text[:30] + "..." if len(text) > 30 else text
+        self._log.info("[%02d:%02d] %s: %s", ts // 60, ts % 60, label, short)
+
+    def _refine_boundaries(self, clips: list) -> list:
+        """后处理: 二分搜索精化每个 clip 的起止边界 (±1帧精度)。"""
+        from app.core.coarse_to_fine import BoundaryRefiner
+        from app.core.detector import DetectionResult
+        from app.core.player import VideoPlayer
+
+        player = VideoPlayer()
+        info = player.open(self._project.source.path)
+        fps = info.fps
+        player.close()
+
+        rois = self._project.annotations.to_pixel_rois(info.width, info.height)
+        kill_idx = 0
+        for i, roi in enumerate(rois):
+            if roi.label == '击杀信息':
+                kill_idx = i
+                break
+
+        refiner = BoundaryRefiner(
+            self._project.source.path, rois, kill_idx)
+        search_window = self._project.detection.refine_search_window
+
+        refined = []
+        for c in clips:
+            r = DetectionResult(
+                start_sec=c.start_sec, end_sec=c.end_sec,
+                action=c.action, actor=c.actor,
+                pattern_id=c.pattern_id, source=c.source)
+            rr = refiner.refine(r, fps, search_window=search_window)
+            refined.append(ClipResult(
+                start_sec=rr.start_sec, end_sec=rr.end_sec,
+                action=rr.action, actor=rr.actor,
+                pattern_id=rr.pattern_id, source=rr.source))
+        return refined
+
+    def _cell_divide_events(self, clips: list) -> list:
+        """后处理: BinSeg 细胞分裂 — 在大事件中递归搜索更多子事件。"""
+        from app.core.coarse_to_fine import binseg_event_search
+        from app.core.detector import OCRDetector
+        from app.core.player import VideoPlayer
+        import numpy as np
+
+        detector = OCRDetector(gpu=self._project.detection.gpu)
+        detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
+
+        player = VideoPlayer()
+        info = player.open(self._project.source.path)
+        fps = info.fps
+        player.close()
+
+        rois = self._project.annotations.to_pixel_rois(info.width, info.height)
+        kill_idx = 0
+        for i, roi in enumerate(rois):
+            if roi.label == '击杀信息':
+                kill_idx = i
+                break
+
+        min_gap = self._project.detection.cell_min_gap
+        search_window = self._project.detection.refine_search_window
+
+        all_results = []
+        for c in clips:
+            if c.end_sec - c.start_sec < min_gap:
+                all_results.append(c)
+                continue
+            sub_events, merged_n, short_n, short_info = binseg_event_search(
+                self._project.source.path, rois, kill_idx,
+                c.start_sec, c.end_sec, fps,
+                detector, self._matcher,
+                min_segment=min_gap, search_window=search_window,
+                allowed_actors=self._project.detection.allowed_actors,
+            )
+            if merged_n:
+                self._log.info("细胞分裂: 合并了 %d 个重叠事件", merged_n)
+            if short_n:
+                self._log.warning("细胞分裂: 过滤了 %d 个短事件 (%s)", short_n,
+                                  ', '.join(s['action'] for s in short_info[:5]))
+            if sub_events:
+                for se in sub_events:
+                    all_results.append(ClipResult(
+                        start_sec=se.start_sec, end_sec=se.end_sec,
+                        action=se.action, actor=se.actor,
+                        pattern_id=se.pattern_id, source=se.source))
+            else:
+                all_results.append(c)
+        return all_results
+
+    def _on_ocr_error(self, msg: str):
+        self._log.error("OCR线程错误: %s", msg)
+        self.statusBar().showMessage(f"OCR线程出错: {msg}", 5000)
+
+    def _on_ocr_thread_done(self, tid: int, ranges: list, report=None):
+        self._log.debug("_on_ocr_thread_done: tid=%d, ranges=%d, report=%s",
+                        tid, len(ranges), report is not None)
         self._thread_results[tid] = ranges; self._completed += 1
+        if report is not None:
+            self._thread_reports[tid] = report
         if tid < len(self._thread_bars):
             self._thread_bars[tid].setValue(100)
             self._thread_bars[tid].setFormat(f"线程 {tid + 1}: 完成")
         if self._completed >= len(self._ocr_threads):
+            self._log.debug("所有线程完成, 构建结果...")
             self._progress_widget.setVisible(False)
             self._filter_bar.setVisible(True)
             self._result_label.setText("识别结果")
@@ -511,15 +660,79 @@ class MainWindow(QMainWindow):
                     s, e = item[0], item[1]
                     action = item[2] if len(item) > 2 else ""
                     actor = item[3] if len(item) > 3 else ""
+                    pid = item[4] if len(item) > 4 else ""
+                    src = item[5] if len(item) > 5 else "text"
                     all_clips.append(ClipResult(
-                        start_sec=s, end_sec=e, action=action, actor=actor))
+                        start_sec=s, end_sec=e, action=action, actor=actor,
+                        pattern_id=pid, source=src))
+            self._log.debug("构建 %d 个 ClipResult", len(all_clips))
+            if self._project.detection.refine_boundaries and all_clips:
+                try:
+                    all_clips = self._refine_boundaries(all_clips)
+                except Exception as e:
+                    self._log.error("边界精化失败 (跳过): %s", e)
+            if self._project.detection.cell_divide and all_clips:
+                try:
+                    all_clips = self._cell_divide_events(all_clips)
+                except Exception as e:
+                    self._log.error("细胞分裂失败 (跳过): %s", e)
             if all_clips:
                 all_clips.sort(key=lambda c: c.start_sec)
                 self._project.set_results(all_clips)
+            self._save_detection_report(all_clips)
             self._show_results()
+            self._log.info("检测流程完成(legacy): %d 个片段", len(all_clips))
+
+    def _save_detection_report(self, results: list):
+        from app.core.detector import DetectionReport
+        try:
+            self._do_save_detection_report(results)
+        except Exception as e:
+            self._log.error("保存检测报告异常: %s", e)
+
+    def _do_save_detection_report(self, results: list):
+        from app.core.detector import DetectionReport
+        reports = [r for r in self._thread_reports.values() if r is not None]
+        src = self._project.source
+        self._log.debug("_do_save_detection_report: %d reports, %d results, src.path=%s",
+                        len(reports), len(results), src.path)
+        if reports:
+            merged = reports[0]
+            for other in reports[1:]:
+                merged.frames_log.extend(other.frames_log)
+                merged.dropped.extend(other.dropped)
+                merged.counter_events.extend(other.counter_events)
+                merged.results.extend(other.results)
+            merged.frames_log.sort(key=lambda f: (f.timestamp, f.roi_id))
+            merged.dropped.sort(key=lambda d: d.timestamp)
+            merged.counter_events.sort(key=lambda e: e["timestamp"])
+        else:
+            merged = DetectionReport(
+                video_path=src.path,
+                video_width=src.width, video_height=src.height,
+                video_fps=src.fps,
+                video_duration_sec=src.total_frames / max(src.fps, 1),
+                config={"pipeline_mode": self._project.detection.pipeline_mode},
+                rois=[{"id": i, "label": r.label}
+                      for i, r in enumerate(self._project.annotations.regions)],
+            )
+        merged.results = [
+            {"start_sec": c.start_sec, "end_sec": c.end_sec,
+             "action": c.action, "actor": c.actor,
+             "pattern_id": c.pattern_id, "source": c.source}
+            for c in results
+        ]
+        merged.summary.detections_after_merge = len(results)
+        log_path = src.dirname and os.path.join(
+            src.dirname, f"{src.basename}.detection_log.json")
+        if not log_path:
+            return
+        merged.save_json(log_path)
+        self._log.info("检测报告已保存: %s", log_path)
 
     def _show_results(self):
         count = self._project.result_count
+        self._log.debug("_show_results: result_count=%d", count)
         self.statusBar().showMessage(f"识别完成! {count} 个高光片段")
         self._detect_btn.setEnabled(True)
         self._result_list.clear()
@@ -528,7 +741,8 @@ class MainWindow(QMainWindow):
             sm, ss = int(r.start_sec // 60), int(r.start_sec % 60)
             em, es = int(r.end_sec // 60), int(r.end_sec % 60)
             tag = f"[{r.actor}·{r.action}]" if r.actor else ""
-            text = f"{tag} 片段 {i+1}: [{sm:02d}:{ss:02d} - {em:02d}:{es:02d}] 时长 {r.duration:.1f}秒"
+            src_mark = {"both": " ★", "counter": " ○"}.get(r.source, "")
+            text = f"{tag} 片段 {i+1}: [{sm:02d}:{ss:02d} - {em:02d}:{es:02d}] 时长 {r.duration:.1f}秒{src_mark}"
             item = QListWidgetItem(text)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
@@ -542,8 +756,14 @@ class MainWindow(QMainWindow):
             btn.setText(f"{actor}({n})")
         self._filter_all_btn.setChecked(True)
         self._filter_bar.setVisible(total > 0)
+        self._player.update_timeline_clips(self._project.results)
         self._update_export_buttons()
         self._update_undo_redo_buttons()
+
+    def _on_timeline_clip_selected(self, idx: int):
+        """时间轴点击片段 → 同步选中结果列表"""
+        if 0 <= idx < self._result_list.count():
+            self._result_list.setCurrentRow(idx)
 
     def _on_result_double_clicked(self, item):
         idx = self._result_list.row(item)

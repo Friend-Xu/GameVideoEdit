@@ -3,7 +3,6 @@
 import json
 import os
 
-import numpy as np
 from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -25,7 +24,7 @@ class SidePanelWidget(QWidget):
     label_colors_changed = Signal(dict)
     history_opened = Signal(str)
 
-    DEFAULT_LABELS = ["击杀提示", "爆头提示", "武器类型", "淘汰播报"]
+    DEFAULT_LABELS = ["击杀信息", "淘汰计数"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -64,16 +63,6 @@ class SidePanelWidget(QWidget):
         self._type_combo.currentTextChanged.connect(
             lambda t: setattr(self, '_current_label', t))
         tl.addWidget(self._type_combo, 1)
-        btn_add = QPushButton("+")
-        btn_add.setFixedSize(30, 30)
-        btn_add.setStyleSheet("QPushButton { padding: 0px; font-weight: bold; font-size: 16px; }")
-        btn_add.clicked.connect(self._add_label_type)
-        tl.addWidget(btn_add)
-        btn_del = QPushButton("-")
-        btn_del.setFixedSize(30, 30)
-        btn_del.setStyleSheet("QPushButton { padding: 0px; font-weight: bold; font-size: 16px; }")
-        btn_del.clicked.connect(self._del_label_type)
-        tl.addWidget(btn_del)
         gl.addLayout(tl)
         self._tag_list = QListWidget()
         self._tag_list.setMinimumHeight(120)
@@ -123,35 +112,6 @@ class SidePanelWidget(QWidget):
             QColor(220, 120, 50, 200), QColor(150, 50, 220, 200),
         ]
         return {l: base[i % len(base)] for i, l in enumerate(self._label_types)}
-
-    def _add_label_type(self):
-        name, ok = QInputDialog.getText(self, "添加标签", "标签名称:")
-        if ok and name and name not in self._label_types:
-            self._label_types.append(name)
-            self._type_combo.addItem(name)
-            self._label_colors[name] = QColor(
-                np.random.randint(50, 200), np.random.randint(50, 200),
-                np.random.randint(50, 200), 200)
-            self.label_colors_changed.emit(self._label_colors)
-
-    def _del_label_type(self):
-        t = self._type_combo.currentText()
-        if t in self.DEFAULT_LABELS:
-            QMessageBox.warning(self, "警告", "默认标签不能删除")
-            return
-        self._label_types.remove(t)
-        self._type_combo.removeItem(self._type_combo.currentIndex())
-        self._label_colors.pop(t, None)
-        if self._project:
-            w = self._project.source.width
-            h = self._project.source.height
-            for r in list(self._project.annotations.regions):
-                if r.label == t:
-                    self._project.annotations.remove_region(r.id)
-            self._project.auto_save_roi()
-            self.refresh_tag_list()
-        self.label_colors_changed.emit(self._label_colors)
-        self.regions_changed.emit()
 
     def _on_tag_selected(self):
         items = self._tag_list.selectedItems()

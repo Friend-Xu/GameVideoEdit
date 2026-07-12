@@ -184,48 +184,146 @@ def cmd_detect(args):
     if args.actors:
         actors = set(a.strip() for a in args.actors.split(","))
 
-    engine = DetectionEngine(
-        matcher, detector,
-        padding_before=args.padding_before,
-        padding_after=args.padding_after,
-        skip_frames=args.skip_frames,
-        merge_gap=args.merge_gap,
-        mode=args.mode,
-        interval_sec=args.interval,
-        post_detect_skip_sec=args.post_detect_skip,
-        allowed_actors=actors,
-    )
+    pipeline_mode = args.pipeline
 
-    print("开始检测...")
-    time_ranges = engine.run_full(
-        video_path=args.video,
-        annotations=annotations,
-        start_frame=args.start_frame,
-        end_frame=args.end_frame if args.end_frame >= 0 else None,
-        progress_cb=lambda pct: print(f"\r  进度: {pct:.1f}%", end="", flush=True),
-        detected_cb=lambda ts, text: print(f"\n  检测 [{ts:.1f}s]: {text[:60]}"),
-    )
+    print(f"流水线模式: {pipeline_mode}")
+
+    if pipeline_mode == "pool":
+        from app.core.detector import DetectionPipeline
+        from app.core.player import VideoPlayer
+        player = VideoPlayer()
+        info = player.open(args.video)
+        player.close()
+        pipeline = DetectionPipeline(
+            matcher, detector,
+            padding_before=args.padding_before,
+            padding_after=args.padding_after,
+            skip_frames=args.skip_frames,
+            mode=args.mode,
+            interval_sec=args.interval,
+            allowed_actors=actors,
+            cpu_workers=args.cpu_workers,
+            gpu_workers=args.gpu_workers,
+        )
+        print("开始检测 (Pool 模式)...")
+        time_ranges, report = pipeline.run_full(
+            video_path=args.video,
+            annotations=annotations,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame if args.end_frame >= 0 else None,
+            progress_cb=lambda pct: print(f"\r  进度: {pct:.1f}%", end="", flush=True),
+            detected_cb=lambda ts, text: print(f"\n  检测 [{ts:.1f}s]: {text[:60]}"),
+        )
+    else:
+        engine = DetectionEngine(
+            matcher, detector,
+            padding_before=args.padding_before,
+            padding_after=args.padding_after,
+            skip_frames=args.skip_frames,
+            merge_gap=args.merge_gap,
+            mode=args.mode,
+            interval_sec=args.interval,
+            post_detect_skip_sec=args.post_detect_skip,
+            allowed_actors=actors,
+        )
+        print("开始检测 (Legacy 模式)...")
+        time_ranges, report = engine.run_full(
+            video_path=args.video,
+            annotations=annotations,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame if args.end_frame >= 0 else None,
+            progress_cb=lambda pct: print(f"\r  进度: {pct:.1f}%", end="", flush=True),
+            detected_cb=lambda ts, text: print(f"\n  检测 [{ts:.1f}s]: {text[:60]}"),
+        )
+
     print(f"\r  进度: 100.0%")
     print(f"完成: 找到 {len(time_ranges)} 个片段")
 
+    # ── 后处理: 边界精化 + 细胞分裂 ──
+    if args.refine or args.cell_divide:
+        from app.core.coarse_to_fine import BoundaryRefiner, binseg_event_search
+        from app.core.player import VideoPlayer
+        player = VideoPlayer()
+        info = player.open(args.video)
+        fps = info.fps
+        player.close()
+        rois = annotations.to_pixel_rois(info.width, info.height)
+        kill_idx = 0
+        for i, roi in enumerate(rois):
+            if roi.label == '击杀信息':
+                kill_idx = i
+                break
+
+    if args.refine:
+        refiner = BoundaryRefiner(args.video, rois, kill_idx)
+        refined = []
+        for r in time_ranges:
+            rr = refiner.refine(r, fps, search_window=args.refine_search_window)
+            refined.append(rr)
+        time_ranges = refined
+        print(f"边界精化完成: {len(time_ranges)} 个片段")
+
+    if args.cell_divide:
+        all_results = []
+        for r in time_ranges:
+            if r.end_sec - r.start_sec < args.cell_min_gap:
+                all_results.append(r)
+                continue
+            sub, merged_n, short_n, short_info = binseg_event_search(
+                args.video, rois, kill_idx,
+                r.start_sec, r.end_sec, fps,
+                detector, matcher,
+                min_segment=args.cell_min_gap,
+                search_window=args.refine_search_window,
+                allowed_actors=actors,
+            )
+            if merged_n:
+                print(f"  [合并] {merged_n} 个重叠事件")
+            if short_n:
+                print(f"  [过滤] {short_n} 个短事件: {', '.join(s['action'][:4] for s in short_info)}")
+            if sub:
+                all_results.extend(sub)
+            else:
+                all_results.append(r)
+        time_ranges = all_results
+        print(f"细胞分裂完成: {len(time_ranges)} 个片段")
+
+    from app.core.player import VideoPlayer as _VP
+    from app.core.detector import DetectionReport
+    _vp = _VP(); _vinfo = _vp.open(args.video); _vp.close()
     output = {
         "version": "2.0",
-        "video": args.video,
-        "total_clips": len(time_ranges),
-        "clips": [
+        "last_detection": "",
+        "source": {
+            "path": args.video,
+            "width": _vinfo.width,
+            "height": _vinfo.height,
+            "fps": _vinfo.fps,
+            "total_frames": _vinfo.total_frames,
+        },
+        "detection": {
+            "mode": args.mode,
+            "interval_sec": args.interval,
+            "skip_frames": args.skip_frames,
+            "post_detect_skip_sec": args.post_detect_skip,
+            "padding_before": args.padding_before,
+            "padding_after": args.padding_after,
+            "merge_gap": args.merge_gap,
+            "num_threads": 1,
+            "rotation": 0,
+        },
+        "results": [
             {
                 "start_sec": r.start_sec,
                 "end_sec": r.end_sec,
-                "duration": r.duration,
+                "pattern_id": r.pattern_id,
                 "action": r.action,
                 "actor": r.actor,
-                "pattern_id": r.pattern_id,
-                "match_count": r.match_count,
-                "start": f"{int(r.start_sec // 60):02d}:{r.start_sec % 60:05.2f}",
-                "end": f"{int(r.end_sec // 60):02d}:{r.end_sec % 60:05.2f}",
+                "source": getattr(r, 'source', 'text'),
             }
             for r in time_ranges
         ],
+        "export": {},
     }
 
     if not args.output:
@@ -237,6 +335,41 @@ def cmd_detect(args):
         print(f"结果已保存: {args.output}")
     else:
         print(json.dumps(output, ensure_ascii=False, indent=2))
+
+    log_path = (args.output or "").replace(".project.json", ".detection_log.json")
+    if log_path and log_path != args.output:
+        report_rois = []
+        for i, r in enumerate(annotations.regions):
+            report_rois.append({"id": i, "label": r.label})
+        pipeline = "pool" if pipeline_mode == "pool" else "legacy"
+        report = DetectionReport(
+            video_path=os.path.abspath(args.video),
+            video_width=_vinfo.width, video_height=_vinfo.height,
+            video_fps=_vinfo.fps,
+            video_duration_sec=_vinfo.total_frames / max(_vinfo.fps, 1),
+            config={
+                "pipeline": pipeline,
+                "mode": args.mode,
+                "interval_sec": args.interval,
+                "skip_frames": args.skip_frames,
+                "padding_before": args.padding_before,
+                "padding_after": args.padding_after,
+            },
+            rois=report_rois,
+        )
+        report.results = [
+            {"start_sec": r.start_sec, "end_sec": r.end_sec,
+             "action": r.action, "actor": r.actor,
+             "pattern_id": r.pattern_id,
+             "source": getattr(r, 'source', 'text')}
+            for r in time_ranges
+        ]
+        report.summary.detections_after_merge = len(time_ranges)
+        try:
+            report.save_json(log_path)
+            print(f"检测报告已保存: {log_path}")
+        except Exception as e:
+            print(f"保存检测报告失败: {e}")
 
     return 0
 
@@ -296,6 +429,18 @@ def main() -> int:
     p.add_argument("--merge-gap", type=float, default=30.0, help="合并相邻片段的最大间隔(秒)")
     p.add_argument("--actors", help="过滤角色: 自己,队友 (逗号分隔，默认不过滤)")
     p.add_argument("--cpu", action="store_true", help="使用 CPU 模式")
+    p.add_argument("--pipeline", choices=["legacy", "pool"],
+                   default="legacy", help="流水线模式 (默认 legacy)")
+    p.add_argument("--cpu-workers", type=int, default=3, help="Pool 模式 CPU 线程数")
+    p.add_argument("--gpu-workers", type=int, default=2, help="Pool 模式 GPU 线程数")
+    p.add_argument("--refine", action="store_true",
+                   help="后处理: 二分搜索精化事件边界至 ±1 帧")
+    p.add_argument("--refine-search-window", type=float, default=2.0,
+                   help="二分搜索范围(秒)")
+    p.add_argument("--cell-divide", action="store_true",
+                   help="后处理: BinSeg 细胞分裂递归搜索子事件")
+    p.add_argument("--cell-min-gap", type=float, default=2.0,
+                   help="细胞分裂最小间隔(秒)")
 
     # ---- match ----
     p = sub.add_parser("match", help="关键词匹配测试")

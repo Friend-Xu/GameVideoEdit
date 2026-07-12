@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import re
 import threading
 import time
@@ -334,6 +335,7 @@ class EventStackEngine:
         self._deadlines.pop(key, None)
         if not events:
             return
+        events.sort(key=lambda e: e.timestamp)
         has_text = any(e.source == "text" for e in events)
         has_counter = any(e.source == "counter" for e in events)
         if has_text and has_counter:
@@ -611,7 +613,7 @@ class FramePrefetcher:
                 try:
                     frame = player.seek(fn)
                     if frame is None:
-                        self._output_queue.put((fn, [], 0.0, False))
+                        self._output_queue.put((fn, [], 0.0, False, False))
                         continue
                     timestamp = fn / max(self._fps, 1)
                     # 文字门控：快速检查击杀信息 ROI
@@ -621,9 +623,9 @@ class FramePrefetcher:
                     else:
                         kill_img = frame[roi['y']:roi['y'] + roi['h'],
                                          roi['x']:roi['x'] + roi['w']]
-                    has_text, _ = self._text_gate.check(kill_img)
+                    has_text, is_new = self._text_gate.check(kill_img)
                     if not has_text:
-                        self._output_queue.put((fn, [], timestamp, False))
+                        self._output_queue.put((fn, [], timestamp, False, False))
                         continue
                     # 有文字 → 预处理所有 ROI
                     prepped = []
@@ -634,9 +636,9 @@ class FramePrefetcher:
                             roi_img = frame[roi['y']:roi['y'] + roi['h'],
                                              roi['x']:roi['x'] + roi['w']]
                         prepped.append((self._detector._preprocess(roi_img), roi))
-                    self._output_queue.put((fn, prepped, timestamp, True))
+                    self._output_queue.put((fn, prepped, timestamp, True, is_new))
                 except Exception:
-                    self._output_queue.put((fn, [], 0.0, False))
+                    self._output_queue.put((fn, [], 0.0, False, False))
         finally:
             try:
                 player.close()
@@ -653,7 +655,9 @@ class DetectionEngine:
                  mode: str = "frame", interval_sec: float = 1.0,
                  post_detect_skip_sec: float = 0.3,
                  allowed_actors: set | None = None,
-                 wait_after: dict[str, float] | None = None):
+                 wait_after: dict[str, float] | None = None,
+                 burst_interval_sec: float = 0.25,
+                 burst_window_sec: float = 3.0):
         self._matcher = matcher
         self._detector = detector
         self.padding_before = padding_before
@@ -665,6 +669,8 @@ class DetectionEngine:
         self.post_detect_skip_sec = post_detect_skip_sec
         self.allowed_actors = allowed_actors
         self._wait_after = wait_after
+        self.burst_interval_sec = burst_interval_sec
+        self.burst_window_sec = burst_window_sec
         self._counter = CounterTracker()
         self._report: DetectionReport | None = None
         self._config_meta: dict = {}
@@ -802,8 +808,12 @@ class DetectionEngine:
         )
 
     def _match_prepped(self, prepped_rois: list, rois: list,
-                       timestamp: float, fn: int, raw_ocr_cb=None):
-        """对预处理器输出的 ROI 图像做 GPU OCR + 关键词匹配"""
+                       timestamp: float, fn: int, raw_ocr_cb=None,
+                       is_new: bool = False, process_counter: bool = True):
+        """对预处理器输出的 ROI 图像做 GPU OCR + 关键词匹配。
+
+        is_new=False 时跳过击杀信息 ROI 的 OCR（文字未变化）。
+        process_counter=False 时跳过淘汰计数 ROI（burst 帧不需要）。"""
         from app.core.keywords import MatchResult
         frame_matched: MatchResult | None = None
         for roi_img, roi in prepped_rois:
@@ -813,6 +823,8 @@ class DetectionEngine:
                 label = roi.get('label', '击杀信息')
             roi_id = self._roi_id(roi, 0)
             if label == '淘汰计数':
+                if not process_counter:
+                    continue
                 for ocr_r in self._detector.detect_raw(roi_img):
                     self._counter.feed(timestamp, ocr_r.text,
                                        log_cb=self._log_counter)
@@ -946,6 +958,8 @@ class DetectionEngine:
             "padding_before": self.padding_before, "padding_after": self.padding_after,
             "merge_gap": self.merge_gap,
             "post_detect_skip_sec": self.post_detect_skip_sec,
+            "burst_interval_sec": self.burst_interval_sec,
+            "burst_window_sec": self.burst_window_sec,
         }
         self._report = self._ensure_report(info, annotations)
         self._report.video_path = video_path
@@ -986,12 +1000,12 @@ class DetectionEngine:
                     item = prefetcher.next_result()
                     if item is None:
                         break
-                    fn, prepped_rois, timestamp, has_text = item
+                    fn, prepped_rois, timestamp, has_text, is_new = item
                     if not has_text or not prepped_rois:
                         continue
                     if cancel_check and cancel_check():
                         break
-                    frame_matched = self._match_prepped(prepped_rois, rois, timestamp, fn, raw_ocr_cb)
+                    frame_matched = self._match_prepped(prepped_rois, rois, timestamp, fn, raw_ocr_cb, is_new)
                     if frame_matched:
                         stack.push(SignalEvent(
                             timestamp=timestamp,
@@ -1031,12 +1045,12 @@ class DetectionEngine:
                     item = prefetcher.next_result()
                     if item is None:
                         break
-                    fn, prepped_rois, timestamp, has_text = item
+                    fn, prepped_rois, timestamp, has_text, is_new = item
                     if not has_text or not prepped_rois:
                         continue
                     if cancel_check and cancel_check():
                         break
-                    frame_matched = self._match_prepped(prepped_rois, rois, timestamp, fn, raw_ocr_cb)
+                    frame_matched = self._match_prepped(prepped_rois, rois, timestamp, fn, raw_ocr_cb, is_new)
                     if frame_matched:
                         stack.push(SignalEvent(
                             timestamp=timestamp,
@@ -1126,3 +1140,368 @@ class DetectionEngine:
             else:
                 merged.append(r)
         return merged
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pool 模式: 解耦 CPU/GPU Worker (config pipeline_mode: pool)
+# ═══════════════════════════════════════════════════════════════
+
+class CPUWorker(threading.Thread):
+    """CPU 工作线程: 视频解码 + 文字门控 + CLAHE 预处理。
+
+    frame_req_queue -> VideoPlayer.seek -> TextPresenceGate
+    -> 无文字: push to skip_queue
+    -> 有文字: CLAHE all ROIs -> push to prepped_queue"""
+
+    def __init__(self, video_path: str, rois: list, fps: float,
+                 detector: "OCRDetector", kill_roi_index: int,
+                 frame_req_queue, prepped_queue, result_queue,
+                 text_gate: "TextPresenceGate" = None):
+        super().__init__(daemon=True)
+        self._video_path = video_path
+        self._rois = rois
+        self._fps = fps
+        self._detector = detector
+        self._kill_roi_index = kill_roi_index
+        self._req = frame_req_queue
+        self._prepped = prepped_queue
+        self._result = result_queue
+        self._gate = text_gate or TextPresenceGate()
+        self._running = False
+
+    def run(self):
+        from app.core.player import VideoPlayer
+        player = VideoPlayer()
+        try:
+            player.open(self._video_path)
+        except Exception:
+            return
+        try:
+            self._running = True
+            while self._running:
+                try:
+                    fn = self._req.get(timeout=0.5)
+                except Exception:
+                    continue
+                if fn is None:
+                    break
+                try:
+                    frame = player.seek(fn)
+                    ts = fn / max(self._fps, 1)
+                    if frame is None:
+                        self._result.put((fn, ts, None))
+                        continue
+                    roi = self._rois[self._kill_roi_index]
+                    if hasattr(roi, 'x'):
+                        ki = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
+                    else:
+                        ki = frame[roi['y']:roi['y'] + roi['h'],
+                                   roi['x']:roi['x'] + roi['w']]
+                    has_text, is_new = self._gate.check(ki)
+                    if not has_text:
+                        self._result.put((fn, ts, None))
+                        continue
+                    prepped = []
+                    for r in self._rois:
+                        if hasattr(r, 'x'):
+                            ri = frame[r.y:r.y + r.h, r.x:r.x + r.w]
+                        else:
+                            ri = frame[r['y']:r['y'] + r['h'],
+                                      r['x']:r['x'] + r['w']]
+                        prepped.append((self._detector._preprocess(ri), r))
+                    self._prepped.put((fn, prepped, ts, is_new))
+                except Exception:
+                    self._result.put((fn, 0.0, None))
+        finally:
+            try:
+                player.close()
+            except Exception:
+                pass
+
+    def stop(self):
+        self._running = False
+        try:
+            self._req.put_nowait(None)
+        except Exception:
+            pass
+
+
+class GPUWorker(threading.Thread):
+    """GPU 工作线程: OCR 识别 + 关键词匹配。
+
+    prepped_queue -> GPU OCR -> KeywordMatch -> CounterTrack -> TextFusion
+    -> FrameResult to result_queue"""
+
+    def __init__(self, detector: "OCRDetector", matcher: "KeywordMatcher",
+                 prepped_queue, result_queue,
+                 counter: "CounterTracker" = None,
+                 counter_event_cb=None,
+                 allowed_actors: set = None,
+                 raw_ocr_cb=None):
+        super().__init__(daemon=True)
+        self._detector = detector
+        self._matcher = matcher
+        self._prepped_queue = prepped_queue
+        self._result_queue = result_queue
+        self._counter = counter or CounterTracker()
+        if counter_event_cb:
+            self._counter.on_event = counter_event_cb
+        self.allowed_actors = allowed_actors
+        self._raw_ocr_cb = raw_ocr_cb
+        self._fusion = TextFusionBuffer()
+        self._running = False
+
+    def run(self):
+        self._running = True
+        while self._running:
+            try:
+                item = self._prepped_queue.get(timeout=0.5)
+            except Exception:
+                continue
+            if item is None:
+                break
+            fn, prepped, ts, _is_new = item
+            try:
+                matched = self._match(prepped, ts, fn)
+                self._result_queue.put((fn, ts, matched))
+            except Exception:
+                self._result_queue.put((fn, ts, None))
+
+    def _match(self, prepped_rois, timestamp, fn):
+        frame_matched = None
+        for roi_img, roi in prepped_rois:
+            label = (getattr(roi, 'label', '') if hasattr(roi, 'label')
+                     else roi.get('label', ''))
+            if label == '淘汰计数':
+                for ocr_r in self._detector.detect_raw(roi_img):
+                    self._counter.feed(timestamp, ocr_r.text)
+                    if self._raw_ocr_cb:
+                        self._raw_ocr_cb(timestamp, ocr_r.text, label)
+            else:
+                ocr_results = self._detector.detect_raw(roi_img)
+                if not ocr_results:
+                    continue
+                if len(ocr_results) > 1:
+                    sorted_r = sorted(ocr_results, key=lambda r: r.bbox[0])
+                    joined = "".join(r.text for r in sorted_r)
+                    jm = self._matcher.match(joined)
+                    if jm and (self.allowed_actors is None or jm.actor in self.allowed_actors):
+                        self._fusion.feed(timestamp, joined,
+                                          min(r.confidence for r in ocr_results))
+                        for ocr_r in ocr_results:
+                            if self._raw_ocr_cb:
+                                self._raw_ocr_cb(timestamp, ocr_r.text, label)
+                        if frame_matched is None:
+                            frame_matched = jm
+                        continue
+                for ocr_r in ocr_results:
+                    if self._raw_ocr_cb:
+                        self._raw_ocr_cb(timestamp, ocr_r.text, label)
+                    match = self._matcher.match(ocr_r.text)
+                    if match:
+                        self._fusion.feed(timestamp, ocr_r.text, ocr_r.confidence)
+                        if (self.allowed_actors is not None
+                                and match.actor not in self.allowed_actors):
+                            continue
+                        if frame_matched is None:
+                            frame_matched = match
+                    else:
+                        fused = self._fusion.feed(timestamp, ocr_r.text,
+                                                  ocr_r.confidence)
+                        if fused:
+                            fm = self._matcher.match(fused)
+                            if fm:
+                                if (self.allowed_actors is not None
+                                        and fm.actor not in self.allowed_actors):
+                                    continue
+                                if frame_matched is None:
+                                    frame_matched = fm
+        return frame_matched
+
+    def stop(self):
+        self._running = False
+        try:
+            self._prepped_queue.put_nowait(None)
+        except Exception:
+            pass
+
+
+class DetectionPipeline:
+    """解耦流水线: CPU Pool -> GPU Pool -> 按 fn 排序 -> EventStack。
+
+    替代 DetectionEngine.run_full() 的调度逻辑。"""
+
+    def __init__(self, matcher, detector,
+                 cpu_workers: int = 3, gpu_workers: int = 2,
+                 padding_before: float = 10.0, padding_after: float = 10.0,
+                 merge_gap: float = 30.0,
+                 allowed_actors: set = None,
+                 wait_after: dict = None,
+                 skip_frames: int = 60,
+                 mode: str = "time", interval_sec: float = 1.0):
+        self._matcher = matcher
+        self._detector = detector
+        self._cpu_n = cpu_workers
+        self._gpu_n = gpu_workers
+        self.padding_before = padding_before
+        self.padding_after = padding_after
+        self.merge_gap = merge_gap
+        self.allowed_actors = allowed_actors
+        self._wait_after = wait_after
+        self._skip_frames = skip_frames
+        self._mode = mode
+        self._interval_sec = interval_sec
+        self._config_meta: dict = {}
+
+    def run_full(self, video_path: str, annotations,
+                 start_frame: int = 0, end_frame: int = None,
+                 progress_cb=None, detected_cb=None,
+                 raw_ocr_cb=None, cancel_check=None):
+        import queue
+        from app.core.player import VideoPlayer
+
+        _log = logging.getLogger("app.core.detector.pipeline")
+        _t0 = time.time()
+        _log.debug("run_full 入口: video=%s, start=%d, end=%s, cpu=%d, gpu=%d",
+                   video_path, start_frame, end_frame, self._cpu_n, self._gpu_n)
+        player = VideoPlayer()
+        info = player.open(video_path)
+        fps = info.fps
+        end = end_frame or (info.total_frames - 1)
+        rois = annotations.to_pixel_rois(info.width, info.height)
+        player.close()
+        _log.debug("视频信息: %dx%d, %.2ffps, %d frames, %d rois",
+                   info.width, info.height, fps, info.total_frames, len(rois))
+
+        self._config_meta = {
+            "pipeline": "pool", "cpu_workers": self._cpu_n,
+            "gpu_workers": self._gpu_n,
+            "padding_before": self.padding_before,
+            "padding_after": self.padding_after,
+            "merge_gap": self.merge_gap,
+            "mode": self._mode, "interval_sec": self._interval_sec,
+            "skip_frames": self._skip_frames,
+        }
+
+        if not rois:
+            _log.warning("run_full: 无 ROI，返回空")
+            return [], None
+
+        kill_idx = 0
+        for i, r in enumerate(rois):
+            label = (getattr(r, 'label', '') if hasattr(r, 'label')
+                     else r.get('label', ''))
+            if label == '击杀信息':
+                kill_idx = i
+                break
+
+        # 单队列: CPU no-text → result_q, GPU OCR → result_q, 阻塞 get
+        frame_req = queue.Queue()
+        prepped_q = queue.Queue()
+        result_q = queue.Queue()
+
+        cpu_pool = [CPUWorker(video_path, rois, fps, self._detector,
+                              kill_idx, frame_req, prepped_q, result_q)
+                    for _ in range(self._cpu_n)]
+        for w in cpu_pool:
+            w.start()
+
+        stack = EventStackEngine(EventStackConfig(
+            wait_after=self._wait_after or {},
+            padding_before=self.padding_before,
+            padding_after=self.padding_after,
+        ))
+
+        gpu_pool = [GPUWorker(self._detector, self._matcher,
+                              prepped_q, result_q,
+                              CounterTracker() if i == 0 else None,
+                              counter_event_cb=stack.push if i == 0 else None,
+                              allowed_actors=self.allowed_actors,
+                              raw_ocr_cb=raw_ocr_cb if i == 0 else None)
+                    for i in range(self._gpu_n)]
+        for w in gpu_pool:
+            w.start()
+
+        # 帧列表: 按 skip_frames 步进 (匹配 legacy frame-mode)
+        frame_nos = []
+        fn = start_frame
+        step = int(fps * self._interval_sec) if self._mode == "time" else self._skip_frames
+        while fn <= end:
+            if cancel_check and cancel_check():
+                break
+            frame_nos.append(fn)
+            fn += step
+
+        total = len(frame_nos)
+        pending: dict[int, tuple] = {}
+        next_idx = 0
+
+        # 一次性提交
+        for fn in frame_nos:
+            frame_req.put(fn)
+            if cancel_check and cancel_check():
+                break
+
+        if progress_cb:
+            progress_cb(0)
+
+        # 单队列阻塞收集 (像 legacy next_result())
+        collected = 0
+        while collected < total:
+            if cancel_check and cancel_check():
+                break
+            fn_r, ts, matched = result_q.get()  # blocking
+            pending[fn_r] = (fn_r, ts, matched)
+            collected += 1
+
+            while next_idx < total:
+                fn = frame_nos[next_idx]
+                if fn not in pending:
+                    break
+                _, ts, matched = pending.pop(fn)
+                if matched:
+                    stack.push(SignalEvent(
+                        timestamp=ts, action=matched.action,
+                        actor=matched.actor,
+                        pattern_id=matched.pattern_id,
+                        raw_text=matched.raw_text, source="text"))
+                    if detected_cb:
+                        detected_cb(ts, matched.raw_text)
+                next_idx += 1
+
+            if progress_cb:
+                pct = (next_idx / total) * 100
+                progress_cb(min(pct, 100.0))
+
+        for w in cpu_pool:
+            w.stop()
+        for w in gpu_pool:
+            w.stop()
+
+        elapsed = time.time() - _t0
+        results = stack.flush()
+        results = DetectionEngine._merge_overlapping(results)
+
+        report = DetectionReport(
+            video_path=video_path,
+            video_width=info.width, video_height=info.height,
+            video_fps=fps,
+            video_duration_sec=info.total_frames / max(fps, 1),
+            config=self._config_meta,
+            rois=[{"id": i, "label": getattr(r, 'label', str(r))}
+                  for i, r in enumerate(rois)],
+        )
+        s = report.summary
+        s.elapsed_seconds = elapsed
+        s.detections_before_merge = stack.total_pushed
+        s.detections_after_merge = len(results)
+        report.results = [
+            {"start_sec": r.start_sec, "end_sec": r.end_sec,
+             "action": r.action, "actor": r.actor,
+             "pattern_id": r.pattern_id, "source": r.source}
+            for r in results
+        ]
+        _log.info("run_full 完成: %d results, %.1fs elapsed, pushed=%d",
+                  len(results), elapsed, stack.total_pushed)
+        return results, report

@@ -21,6 +21,7 @@ class Region:
 @dataclass
 class PixelROI:
     x: int; y: int; w: int; h: int
+    label: str = ""
 
 
 @dataclass
@@ -127,7 +128,7 @@ class AnnotationStore:
             py = max(0, int((r.center_y - r.height / 2) * img_h))
             pw = min(int(r.width * img_w), img_w - px)
             ph = min(int(r.height * img_h), img_h - py)
-            rois.append(PixelROI(px, py, pw, ph))
+            rois.append(PixelROI(px, py, pw, ph, r.label))
         return rois
 
     @property
