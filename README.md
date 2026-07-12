@@ -20,9 +20,11 @@ A desktop application that detects kill events in gameplay videos via OCR and ex
 |---|---|
 | Video Player / 视频播放器 | frame-by-frame, rotation, drag-and-drop, audio playback / 逐帧、旋转、拖拽、音频播放 |
 | Keyboard Shortcuts / 快捷键 | Space: play/pause, ←→: prev/next frame / 空格: 播放暂停, 方向键: 逐帧 |
+| Timeline / 时间轴 | ruler, clip markers, zoom, playhead drag, click-to-seek / 刻度尺、片段标记、缩放、游标拖拽 |
 | Smart Seek / 智能跳转 | double-click clip → jump 1.5s before trigger / 双击片段精准跳转 |
-| ROI Annotation / 区域标注 | multi-label boxes, YOLO-format export / 多标签框选、YOLO格式 |
-| OCR Detection / 文字识别 | EasyOCR + GPU acceleration, multi-threaded / GPU加速、多线程 |
+| ROI Annotation / 区域标注 | multi-label boxes, template presets / 多标签框选、模板预设 |
+| OCR Detection / 文字识别 | EasyOCR + GPU acceleration, multi-threaded pool / GPU加速、多线程流水线 |
+| Logging System / 日志系统 | file rotation + Qt bridge + crash capture / 文件轮转、GUI桥接、崩溃捕获 |
 | Smart Export / 智能导出 | FFmpeg + NVENC/AMF/QSV hardware encode / GPU硬件编码 |
 
 ![screenshot](GUI截图.png)
@@ -37,18 +39,22 @@ A desktop application that detects kill events in gameplay videos via OCR and ex
 └──────────┘    └──────────┘    └──────────┘
 
 app/
-├── core/          # Pure logic / 纯逻辑
-│   ├── player.py  # Video engine / 视频引擎
-│   ├── annotator  # Label model / 标注数据模型
-│   ├── keywords   # Pattern matching / 关键词匹配
-│   ├── detector   # OCR pipeline / OCR流水线
-│   └── exporter   # FFmpeg engine / 导出引擎
-├── ui/            # PySide6 GUI
-│   ├── main_window  # Main window / 主窗口
-│   ├── video_player # Player widget / 播放器
-│   └── overlay      # Annotation overlay / 标注层
-└── workers/       # QThread workers / 后台线程
-cli.py           # CLI tool / 命令行工具
+├── core/            # Pure logic / 纯逻辑
+│   ├── player.py    # Video engine / 视频引擎
+│   ├── annotator.py # Label model / 标注数据模型
+│   ├── keywords.py  # Pattern matching / 关键词匹配
+│   ├── detector.py  # OCR pipeline / OCR流水线
+│   └── exporter.py  # FFmpeg engine / 导出引擎
+├── ui/              # PySide6 GUI
+│   ├── main_window.py  # Main window / 主窗口
+│   ├── video_player.py # Player widget / 播放器
+│   ├── timeline.py     # Timeline widget / 时间轴
+│   ├── overlay.py      # Annotation overlay / 标注层
+│   └── log_window.py   # Log viewer / 日志查看器
+├── utils/           # Utilities / 工具
+│   └── logger.py    # Logging system / 日志系统
+└── workers/         # QThread workers / 后台线程
+cli.py             # CLI tool / 命令行工具
 ```
 
 ## Quick Start | 快速开始
