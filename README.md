@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icons/Logo.png" width="128" alt="Logo"></p>
+
 # GameVideoEdit 药药的剪辑工具
 
 > 和平精英 / PUBG 游戏精彩击杀自动剪辑工具
