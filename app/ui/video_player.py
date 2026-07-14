@@ -198,9 +198,8 @@ class VideoPlayerWidget(QWidget):
         if f is not None:
             self._display_frame(f)
             if self._player.video_info:
-                self._slider.setValue(int(
-                    self._player.current_frame /
-                    self._player.video_info.total_frames * 100))
+                self._timeline.set_position(
+                    self._player.current_frame / self._player.video_info.fps)
 
     def _rotate(self):
         self._rotation = (self._rotation + 90) % 360

@@ -6,10 +6,11 @@
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
-from app.utils.paths import models_dir, easyocr_engine_dir, easyocr_models_dir
+from app.utils.paths import models_dir, easyocr_engine_dir, easyocr_models_dir, rapidocr_models_dir
 
 
 def _ensure_engine_importable() -> None:
@@ -30,6 +31,7 @@ class ModelManager:
 
     _instance: "ModelManager | None" = None
     _readers: dict[str, Any] = {}
+    _rapidocr_local = threading.local()
 
     def __new__(cls) -> "ModelManager":
         if cls._instance is None:
@@ -56,11 +58,22 @@ class ModelManager:
         info = self._registry.get("models", {}).get(model_id, {})
         return self._model_dir / info.get("file", "")
 
-    def get_easyocr_reader(self, gpu: bool = True, languages: list[str] | None = None):
-        """获取共享的 EasyOCR Reader 实例。
+    # ── 统一引擎入口 ──
 
-        同一个 (languages, gpu) 组合只创建一个 Reader。
+    def get_engine(self, engine_type: str = "rapidocr", gpu: bool = True,
+                   languages: list[str] | None = None):
+        """统一引擎入口：ModelManager 是所有 OCR 引擎的唯一来源。
+
+        engine_type: "rapidocr" | "easyocr"
         """
+        if engine_type == "rapidocr":
+            return self._get_rapidocr_engine(gpu)
+        return self._get_easyocr_reader(gpu, languages)
+
+    # ── EasyOCR ──
+
+    def _get_easyocr_reader(self, gpu: bool = True, languages: list[str] | None = None):
+        """获取共享的 EasyOCR Reader 实例（单例缓存）。"""
         if languages is None:
             languages = ["ch_sim", "en"]
 
@@ -86,6 +99,31 @@ class ModelManager:
                 path = self._model_dir / info.get("file", "")
                 results[model_id] = path.exists()
         return results
+
+    def _get_rapidocr_engine(self, gpu: bool = True):
+        """获取 RapidOCR 引擎实例（thread-local 缓存，每线程独立 GPU session）。"""
+        cache_key = f"rapidocr_gpu={gpu}"
+        store = getattr(self._rapidocr_local, "readers", None)
+        if store is None:
+            store = {}
+            self._rapidocr_local.readers = store
+        if cache_key not in store:
+            from rapidocr import RapidOCR
+            mdir = rapidocr_models_dir()
+            store[cache_key] = RapidOCR(params={
+                "Det.model_path": str(mdir / "ch_PP-OCRv4_det_infer.onnx"),
+                "Cls.model_path": str(mdir / "ch_ppocr_mobile_v2.0_cls_infer.onnx"),
+                "Rec.model_path": str(mdir / "ch_PP-OCRv4_rec_infer.onnx"),
+                "Rec.rec_keys_path": str(mdir / "ppocr_keys_v1.txt"),
+                "EngineConfig.onnxruntime.use_cuda": gpu,
+                "EngineConfig.onnxruntime.cuda_ep_cfg.arena_extend_strategy": "kSameAsRequested",
+                "EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit": 1024 * 1024 * 1024,
+                "EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search": "DEFAULT",
+                "Det.box_thresh": 0.3,
+                "Det.limit_side_len": 480,
+                "Global.max_side_len": 480,
+            })
+        return store[cache_key]
 
     def release_all(self) -> None:
         """释放所有模型资源"""

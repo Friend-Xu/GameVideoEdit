@@ -5,12 +5,15 @@ Phase 2: DenseScanner — dense TextPresenceGate scan + selective OCR within can
 Phase 3: BoundaryRefiner — binary search refinement of event boundaries.
 """
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
 
 import cv2
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 from app.core.annotator import AnnotationStore
 from app.core.detector import (
@@ -20,6 +23,7 @@ from app.core.detector import (
     DetectionResult,
     EventStackConfig,
     EventStackEngine,
+    FrameLogger,
     OCRDetector,
     SignalEvent,
     TextFusionBuffer,
@@ -431,7 +435,139 @@ class CoarseToFinePipeline:
 
 
 # ═══════════════════════════════════════════════════════════════
-# BinSeg 递归事件搜索 (细胞分裂)
+# Gap Binary Search —— 基于粗扫间隙的二分搜索 (方案A)
+# ═══════════════════════════════════════════════════════════════
+
+def _same_event(a: dict | None, b: dict | None) -> bool:
+    """判断两个粗扫命中是否属于同一事件 (基于结构化字段比较)。"""
+    if a is None or b is None:
+        return False
+    return (a.get('action'), a.get('actor')) == (b.get('action'), b.get('actor'))
+
+
+def _extract_coarse_hits(frame_logger: "FrameLogger") -> list[dict]:
+    """从 FrameLogger 提取粗扫命中点 (match_hit=True)，按时间排序合并相邻同事件。"""
+    from app.core.detector import FrameLogger as FL
+    hits: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for f in frame_logger.frames:
+        if not f.match_hit or f.stage == "cell_divide":
+            continue
+        ts = round(f.timestamp, 2)
+        key = (ts, f.match_action, f.match_actor)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        hits.append({
+            "timestamp": ts,
+            "action": f.match_action,
+            "actor": f.match_actor,
+            "pattern_id": f.match_pattern_id,
+            "ocr_text": f.ocr_text,
+        })
+    hits.sort(key=lambda h: h["timestamp"])
+    # 合并连续的同事件命中
+    if not hits:
+        return hits
+    merged = [hits[0]]
+    for h in hits[1:]:
+        if _same_event(merged[-1], h) and h["timestamp"] - merged[-1]["timestamp"] < 5.0:
+            merged[-1] = h  # 保留最新的
+        else:
+            merged.append(h)
+    return merged
+
+
+def gap_binary_search(video_path: str, pixel_rois: list, kill_roi_index: int,
+                      fps: float, coarse_hits: list[dict],
+                      search_window: float = 2.0,
+                      cancel_check: Callable[[], bool] | None = None,
+                      raw_ocr_cb: Callable[[float, str, str], None] | None = None,
+                      progress_cb: Callable[[float], None] | None = None,
+                      ) -> list[DetectionResult]:
+    """基于粗扫命中间隙的二分搜索，精确确定事件边界。
+
+    coarse_hits: 粗扫命中的结构化列表，每项含 timestamp, action, actor, pattern_id, ocr_text。
+    对每对相邻命中分析状态转换，在间隙中二分搜索精确边界。
+
+    四种间隙处理:
+      - 同事件延续: 跳过 (无需分裂)
+      - 不同事件: 二分搜索事件A文字的消失点 (last_has_text)
+      - 首个事件前: 二分搜索 first_has_text 确定精确起点
+      - 末个事件后: 二分搜索 last_has_text 确定精确终点
+    """
+    if not coarse_hits:
+        return []
+
+    player = VideoPlayer()
+    info = player.open(video_path)
+    kill_roi = pixel_rois[kill_roi_index]
+    refiner = BoundaryRefiner.__new__(BoundaryRefiner)
+    refiner._video_path = video_path
+    refiner._rois = pixel_rois
+    refiner._kill_idx = kill_roi_index
+    max_sec = info.total_frames / max(fps, 1)
+
+    events: list[DetectionResult] = []
+    n = len(coarse_hits)
+
+    try:
+        i = 0
+        while i < n:
+            hit = coarse_hits[i]
+            ts = hit["timestamp"]
+
+            # ── 找此事件的精确 start (在命中点附近 search_window 内) ──
+            start = refiner._binary_search_boundary(
+                player, kill_roi, fps,
+                lower=max(0, ts - search_window),
+                upper=ts,
+                target="first_has_text",
+                cancel_check=cancel_check,
+            )
+
+            # ── 找此事件最后一个同事件命中 (跳过同事件延续的 1s 采样) ──
+            j = i + 1
+            while j < n and _same_event(hit, coarse_hits[j]):
+                j += 1
+            last_ts = coarse_hits[j - 1]["timestamp"]
+
+            # ── 找此事件的精确 end (在最后一个命中点附近 search_window 内) ──
+            end = refiner._binary_search_boundary(
+                player, kill_roi, fps,
+                lower=last_ts,
+                upper=last_ts + search_window,
+                target="last_has_text",
+                cancel_check=cancel_check,
+            )
+
+            _log.debug("[gap_search] 事件 %d: [%.2fs - %.2fs] %s:%s",
+                       len(events), start, end,
+                       hit.get('action', '?'), hit.get('actor', '?'))
+            if raw_ocr_cb:
+                raw_ocr_cb(start, hit.get('ocr_text', ''), '击杀信息')
+
+            events.append(DetectionResult(
+                start_sec=start, end_sec=end,
+                action=hit.get('action', ''),
+                actor=hit.get('actor', ''),
+                pattern_id=hit.get('pattern_id', ''),
+                source="text",
+            ))
+
+            if progress_cb:
+                progress_cb((i + 1) / max(n, 1) * 100)
+
+            i = j
+
+    finally:
+        player.close()
+
+    return events
+
+
+# ═══════════════════════════════════════════════════════════════
+# BinSeg 递归事件搜索 (细胞分裂) — 旧实现，保留作为回退
 # ═══════════════════════════════════════════════════════════════
 
 def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
@@ -442,7 +578,10 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
                         fusion: "TextFusionBuffer | None" = None,
                         cancel_check: Callable[[], bool] | None = None,
                         allowed_actors: set | None = None,
-                        depth: int = 0) -> list[DetectionResult]:
+                        depth: int = 0,
+                        frame_logger: "FrameLogger | None" = None,
+                        progress_cb: Callable[[float], None] | None = None,
+                        raw_ocr_cb: Callable[[float, str, str], None] | None = None) -> list[DetectionResult]:
     """BinSeg 事件搜索 —— 细胞分裂式查找击杀/击倒子事件。
 
     借鉴 Recursive Binary Segmentation (Vostrikova 1981):
@@ -461,6 +600,9 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
     if fusion is None:
         fusion = TextFusionBuffer()
 
+    _log.debug("[细胞分裂 d=%d] 进入区域 [%.2fs - %.2fs] (跨度 %.1fs)",
+               depth, region_start, region_end, region_end - region_start)
+
     player = VideoPlayer()
     player.open(video_path)
     kill_roi = pixel_rois[kill_roi_index]
@@ -471,7 +613,10 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
 
     try:
         t = region_start
+        region_span = max(region_end - region_start, 0.001)
         while t <= region_end:
+            if progress_cb:
+                progress_cb((t - region_start) / region_span)
             if cancel_check and cancel_check():
                 break
             fn = int(t * fps)
@@ -483,8 +628,11 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
             timestamp = fn / max(fps, 1)
             match = _match_killfeed_frame(
                 frame, pixel_rois, timestamp, detector, matcher,
-                fusion, allowed_actors)
+                fusion, allowed_actors, frame_logger=frame_logger,
+                raw_ocr_cb=raw_ocr_cb)
             if match:
+                _log.debug("[细胞分裂 d=%d] t=%.2fs fn=%d: 命中! action=%s actor=%s raw_text=%s",
+                           depth, timestamp, fn, match.action, match.actor, match.raw_text[:60])
                 # 二分搜索精确文字边界
                 new_start = refiner._binary_search_boundary(
                     player, kill_roi, fps,
@@ -500,6 +648,8 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
                     target="last_has_text",
                     cancel_check=cancel_check,
                 )
+                _log.debug("[细胞分裂 d=%d] 边界: [%.2fs, %.2fs] -> [%.2fs, %.2fs]",
+                           depth, region_start, region_end, new_start, new_end)
 
                 events.append(DetectionResult(
                     start_sec=new_start, end_sec=new_end,
@@ -507,7 +657,7 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
                     pattern_id=match.pattern_id, source="text",
                 ))
 
-                # 递归左侧
+                # 递归左侧 (不传 progress_cb，避免进度条回跳)
                 if new_start - region_start > min_segment:
                     left_evts, _, _, _ = binseg_event_search(
                         video_path, pixel_rois, kill_roi_index,
@@ -515,10 +665,12 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
                         detector, matcher, scan_step, min_segment,
                         search_window, fusion, cancel_check,
                         allowed_actors, depth + 1,
+                        frame_logger=frame_logger,
+                        raw_ocr_cb=raw_ocr_cb,
                     )
                     events.extend(left_evts)
 
-                t = new_end
+                t = new_end + scan_step
                 continue
 
             t += scan_step
@@ -540,6 +692,10 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
     if short_count > 0 or merged_count > 0:
         # 返回统计信息作为额外属性
         pass
+
+    _log.debug("[细胞分裂 d=%d] 区域完成 [%.2fs - %.2fs]: %d 事件(合并%d, 过滤%d)",
+               depth, region_start, region_end,
+               len(events), merged_count, short_count)
 
     return events, merged_count, short_count, short_summary
 
@@ -591,11 +747,13 @@ def _filter_short_events(events: list[DetectionResult],
 
 def _match_killfeed_frame(frame, pixel_rois, timestamp,
                           detector, matcher, fusion,
-                          allowed_actors: set | None = None):
+                          allowed_actors: set | None = None,
+                          frame_logger: "FrameLogger | None" = None,
+                          raw_ocr_cb: Callable[[float, str, str], None] | None = None):
     """OCR + 关键词匹配单帧的击杀信息 ROI。返回 MatchResult 或 None。"""
     from app.core.keywords import MatchResult
     frame_matched: MatchResult | None = None
-    for roi in pixel_rois:
+    for roi_idx, roi in enumerate(pixel_rois):
         label = roi.label
         if label == '淘汰计数':
             continue  # 细胞分裂时跳过计数器，只关注击杀信息
@@ -604,6 +762,15 @@ def _match_killfeed_frame(frame, pixel_rois, timestamp,
         ocr_results = detector.detect_raw(prepped)
         if not ocr_results:
             continue
+        # 记录 OCR 文本
+        if frame_logger:
+            for ocr_r in ocr_results:
+                frame_logger.log_sample(
+                    timestamp, label, roi_idx, ocr_r.text, ocr_r.confidence,
+                    stage="cell_divide")
+        if raw_ocr_cb:
+            for ocr_r in ocr_results:
+                raw_ocr_cb(timestamp, ocr_r.text, label)
         if len(ocr_results) > 1:
             sorted_r = sorted(ocr_results, key=lambda r: r.bbox[0])
             joined = "".join(r.text for r in sorted_r)
@@ -611,6 +778,13 @@ def _match_killfeed_frame(frame, pixel_rois, timestamp,
             if jm and (allowed_actors is None or jm.actor in allowed_actors):
                 fusion.feed(timestamp, joined,
                             min(r.confidence for r in ocr_results))
+                if frame_logger:
+                    frame_logger.log_sample(
+                        timestamp, label, roi_idx, joined,
+                        min(r.confidence for r in ocr_results),
+                        match_hit=True, match_pattern_id=jm.pattern_id,
+                        match_action=jm.action, match_actor=jm.actor,
+                        stage="cell_divide_match")
                 if frame_matched is None:
                     frame_matched = jm
                 continue
@@ -620,6 +794,12 @@ def _match_killfeed_frame(frame, pixel_rois, timestamp,
                 fusion.feed(timestamp, ocr_r.text, ocr_r.confidence)
                 if allowed_actors is not None and match.actor not in allowed_actors:
                     continue
+                if frame_logger:
+                    frame_logger.log_sample(
+                        timestamp, label, roi_idx, ocr_r.text, ocr_r.confidence,
+                        match_hit=True, match_pattern_id=match.pattern_id,
+                        match_action=match.action, match_actor=match.actor,
+                        stage="cell_divide_match")
                 if frame_matched is None:
                     frame_matched = match
             else:

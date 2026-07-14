@@ -3,6 +3,7 @@
 FFmpeg 切割/合并，GPU 加速 (NVIDIA/AMD/Intel)。
 """
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Callable
 
 from app.core.detector import TimeRange
+
+_log = logging.getLogger("app.core.exporter")
 
 
 @dataclass
@@ -114,17 +117,24 @@ class VideoExporter:
                 if cancel_check and cancel_check():
                     return ExportResult(success=False, message="已取消")
                 cp = Path(self._temp_dir) / f"clip_{i:03d}.mp4"
-                ok, _ = self._cut_clip(video_path, tr, cp, config)
+                _log.debug("切割片段 %d/%d: [%.1f-%.1f] dur=%.1f", i+1, total,
+                           tr.start_sec, tr.end_sec, tr.end_sec - tr.start_sec)
+                ok, err = self._cut_reencode(video_path, tr, cp, config)
                 if not ok:
-                    ok, _ = self._cut_reencode(video_path, tr, cp, config)
+                    _log.warning("片段 %d reencode 失败: %s, 尝试 stream copy", i+1, err[:100])
+                    ok, err = self._cut_clip(video_path, tr, cp, config)
                 if ok:
                     clip_paths.append(cp)
                     self._temp_files.append(cp)
+                    _log.debug("片段 %d 切割成功", i+1)
+                else:
+                    _log.error("片段 %d 切割完全失败 (跳过): %s", i+1, err[:100])
                 if progress_callback:
                     progress_callback(5 + int((i + 1) / total * 75), f"片段 {i + 1}/{total}")
 
             if not clip_paths:
                 return ExportResult(success=False, message="所有片段切割失败")
+            _log.info("切割完成: %d/%d 个片段成功", len(clip_paths), total)
 
             if progress_callback:
                 progress_callback(85, "合并片段...")

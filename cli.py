@@ -204,6 +204,11 @@ def cmd_detect(args):
             allowed_actors=actors,
             cpu_workers=args.cpu_workers,
             gpu_workers=args.gpu_workers,
+            gate_mode=args.gate_mode,
+            refine_boundaries=args.refine,
+            refine_search_window=args.refine_search_window,
+            cell_divide=args.cell_divide,
+            cell_min_gap=args.cell_min_gap,
         )
         print("开始检测 (Pool 模式)...")
         time_ranges, report = pipeline.run_full(
@@ -239,8 +244,8 @@ def cmd_detect(args):
     print(f"\r  进度: 100.0%")
     print(f"完成: 找到 {len(time_ranges)} 个片段")
 
-    # ── 后处理: 边界精化 + 细胞分裂 ──
-    if args.refine or args.cell_divide:
+    # ── 后处理: 边界精化 + 细胞分裂 (仅 Legacy 模式, Pool 已内置) ──
+    if (args.refine or args.cell_divide) and args.pipeline != "pool":
         from app.core.coarse_to_fine import BoundaryRefiner, binseg_event_search
         from app.core.player import VideoPlayer
         player = VideoPlayer()
@@ -289,7 +294,6 @@ def cmd_detect(args):
         print(f"细胞分裂完成: {len(time_ranges)} 个片段")
 
     from app.core.player import VideoPlayer as _VP
-    from app.core.detector import DetectionReport
     _vp = _VP(); _vinfo = _vp.open(args.video); _vp.close()
     output = {
         "version": "2.0",
@@ -301,17 +305,7 @@ def cmd_detect(args):
             "fps": _vinfo.fps,
             "total_frames": _vinfo.total_frames,
         },
-        "detection": {
-            "mode": args.mode,
-            "interval_sec": args.interval,
-            "skip_frames": args.skip_frames,
-            "post_detect_skip_sec": args.post_detect_skip,
-            "padding_before": args.padding_before,
-            "padding_after": args.padding_after,
-            "merge_gap": args.merge_gap,
-            "num_threads": 1,
-            "rotation": 0,
-        },
+        "detection": report.config,
         "results": [
             {
                 "start_sec": r.start_sec,
@@ -338,33 +332,6 @@ def cmd_detect(args):
 
     log_path = (args.output or "").replace(".project.json", ".detection_log.json")
     if log_path and log_path != args.output:
-        report_rois = []
-        for i, r in enumerate(annotations.regions):
-            report_rois.append({"id": i, "label": r.label})
-        pipeline = "pool" if pipeline_mode == "pool" else "legacy"
-        report = DetectionReport(
-            video_path=os.path.abspath(args.video),
-            video_width=_vinfo.width, video_height=_vinfo.height,
-            video_fps=_vinfo.fps,
-            video_duration_sec=_vinfo.total_frames / max(_vinfo.fps, 1),
-            config={
-                "pipeline": pipeline,
-                "mode": args.mode,
-                "interval_sec": args.interval,
-                "skip_frames": args.skip_frames,
-                "padding_before": args.padding_before,
-                "padding_after": args.padding_after,
-            },
-            rois=report_rois,
-        )
-        report.results = [
-            {"start_sec": r.start_sec, "end_sec": r.end_sec,
-             "action": r.action, "actor": r.actor,
-             "pattern_id": r.pattern_id,
-             "source": getattr(r, 'source', 'text')}
-            for r in time_ranges
-        ]
-        report.summary.detections_after_merge = len(time_ranges)
         try:
             report.save_json(log_path)
             print(f"检测报告已保存: {log_path}")
@@ -433,6 +400,8 @@ def main() -> int:
                    default="legacy", help="流水线模式 (默认 legacy)")
     p.add_argument("--cpu-workers", type=int, default=3, help="Pool 模式 CPU 线程数")
     p.add_argument("--gpu-workers", type=int, default=2, help="Pool 模式 GPU 线程数")
+    p.add_argument("--gate-mode", choices=["pixel", "neural"],
+                   default="pixel", help="文字门控模式 (默认 pixel)")
     p.add_argument("--refine", action="store_true",
                    help="后处理: 二分搜索精化事件边界至 ±1 帧")
     p.add_argument("--refine-search-window", type=float, default=2.0,

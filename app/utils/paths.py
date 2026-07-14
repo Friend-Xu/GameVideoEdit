@@ -22,6 +22,10 @@ def easyocr_models_dir() -> Path:
     return get_path("models", "easyocr")
 
 
+def rapidocr_models_dir() -> Path:
+    return get_path("models", "rapidocr")
+
+
 def easyocr_engine_dir() -> Path:
     return get_path("engines", "easyocr")
 

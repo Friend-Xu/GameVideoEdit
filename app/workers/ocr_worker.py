@@ -30,13 +30,15 @@ class OCRWorker(QThread):
                  padding_before: float = 10.0, padding_after: float = 10.0,
                  mode: str = "frame", interval_sec: float = 1.0,
                  post_detect_skip_sec: float = 0.3,
-                 allowed_actors: set | None = None):
+                 allowed_actors: set | None = None,
+                 ocr_engine: str = "rapidocr"):
         super().__init__()
         self.thread_id = thread_id
         self._video_path = video_path
         self._annotation = annotation
         self._matcher = matcher
         self._gpu = gpu
+        self._ocr_engine = ocr_engine
         self._skip_frames = skip_frames
         self._start_frame = start_frame
         self._end_frame = end_frame
@@ -50,7 +52,7 @@ class OCRWorker(QThread):
 
     def run(self):
         try:
-            detector = OCRDetector(gpu=self._gpu)
+            detector = OCRDetector(gpu=self._gpu, engine=self._ocr_engine)
             engine = DetectionEngine(
                 self._matcher, detector,
                 padding_before=self._padding_before,
@@ -113,7 +115,8 @@ class PoolOCRWorker(QThread):
                  post_detect_skip_sec: float = 0.3,
                  allowed_actors: set | None = None,
                  cpu_workers: int = 3, gpu_workers: int = 2,
-                 skip_frames: int = 60):
+                 skip_frames: int = 60,
+                 gate_mode: str = "pixel"):
         super().__init__()
         self.thread_id = thread_id
         self._video_path = video_path
@@ -131,6 +134,7 @@ class PoolOCRWorker(QThread):
         self._cpu_workers = cpu_workers
         self._gpu_workers = gpu_workers
         self._skip_frames = skip_frames
+        self._gate_mode = gate_mode
         self._cancel_event = threading.Event()
 
     def run(self):
@@ -166,6 +170,7 @@ class PoolOCRWorker(QThread):
                         skip_frames=self._skip_frames,
                         mode=self._mode,
                         interval_sec=self._interval_sec,
+                        gate_mode=self._gate_mode,
                     )
                     tr, rp = pl.run_full(
                         video_path=self._video_path,

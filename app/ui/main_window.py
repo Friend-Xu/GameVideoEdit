@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QSettings, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QSettings, QThread, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -185,13 +185,12 @@ class MainWindow(QMainWindow):
         w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(0, 0, 0, 0); l.setSpacing(6)
         self._total_bar = QProgressBar(); self._total_bar.setRange(0, 100); self._total_bar.setFixedHeight(22)
         l.addWidget(self._total_bar)
+        self._gap_bar = QProgressBar(); self._gap_bar.setRange(0, 100); self._gap_bar.setFixedHeight(18)
+        self._gap_bar.setFormat("精确边界搜索: %p%")
+        self._gap_bar.setVisible(False)
+        l.addWidget(self._gap_bar)
         self._thread_bars: list[QProgressBar] = []
         self._thread_container = QVBoxLayout(); l.addLayout(self._thread_container)
-        self._detect_count_label = QLabel("已检测到: 0")
-        self._detect_count_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        self._detect_count_label.setFixedHeight(22)
-        self._detect_count_label.setWordWrap(True)
-        l.addWidget(self._detect_count_label)
         l.addStretch()
         return w
 
@@ -290,6 +289,8 @@ class MainWindow(QMainWindow):
         det.refine_search_window = float(d.get("refine_search_window", 2.0))
         det.cell_divide = bool(d.get("cell_divide", False))
         det.cell_min_gap = float(d.get("cell_min_gap", 2.0))
+        det.gate_mode = d.get("gate_mode", "neural")
+        det.ocr_engine = d.get("ocr_engine", "rapidocr")
 
     def _open_settings(self):
         dlg = SettingsDialog(self._project.detection, self._dark, self)
@@ -331,7 +332,6 @@ class MainWindow(QMainWindow):
         self._result_label.setText("识别进度")
         self._progress_widget.setVisible(True)
         self._total_bar.setValue(0)
-        self._detect_count_label.setText("已检测到: 0")
         for b in self._thread_bars:
             self._thread_container.removeWidget(b)
             b.deleteLater()
@@ -340,7 +340,8 @@ class MainWindow(QMainWindow):
         from app.core.detector import OCRDetector, DetectionPipeline
         try:
             self._log.debug("加载 OCRDetector...")
-            detector = OCRDetector(gpu=True)
+            detector = OCRDetector(gpu=True,
+                                   engine=self._project.detection.ocr_engine)
             import numpy as np
             detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
             self._log.debug("OCRDetector 加载完成")
@@ -369,13 +370,13 @@ class MainWindow(QMainWindow):
                         self._project.source.path, info.width, info.height,
                         fps, total, pipeline_mode, n_threads)
 
-        bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0); bar.setFixedHeight(18)
+        bar = QProgressBar(); bar.setRange(0, 1000); bar.setValue(0); bar.setFixedHeight(18)
         self._thread_bars.append(bar)
         self._thread_container.addWidget(bar)
 
         if pipeline_mode == "pool":
             self._log.debug("进入 pool 模式")
-            bar.setFormat("Pool 模式: %p%")
+            bar.setFormat("扫描进度: %v/%m")
             self._run_detection_pipeline(detector, info, bar)
         else:
             bar.setFormat("线程 1: %p%")
@@ -404,108 +405,121 @@ class MainWindow(QMainWindow):
             for w in self._ocr_threads:
                 w.start()
 
+    class _PoolDetectWorker(QThread):
+        """后台线程执行 DetectionPipeline，避免阻塞 GUI。"""
+        progress = Signal(float)
+        gap_progress = Signal(float)
+        detected = Signal(float, str)
+        raw_text = Signal(float, str, str)
+        finished = Signal(list, object)
+        error = Signal(str)
+
+        def __init__(self, matcher, detector, video_path, annotations, total_frames,
+                     config, parent=None):
+            super().__init__(parent)
+            self._matcher = matcher
+            self._detector = detector
+            self._video_path = video_path
+            self._annotations = annotations
+            self._total_frames = total_frames
+            self._config = config
+            self._cancel_flag = False
+
+        def run(self):
+            from app.core.detector import DetectionPipeline
+            try:
+                pipeline = DetectionPipeline(
+                    self._matcher, self._detector,
+                    cpu_workers=getattr(self._config, 'cpu_workers', 3),
+                    gpu_workers=getattr(self._config, 'gpu_workers', 2),
+                    padding_before=self._config.padding_before,
+                    padding_after=self._config.padding_after,
+                    allowed_actors=self._config.allowed_actors,
+                    skip_frames=self._config.skip_frames,
+                    mode=self._config.mode,
+                    interval_sec=self._config.interval_sec,
+                    gate_mode=self._config.gate_mode,
+                    refine_boundaries=self._config.refine_boundaries,
+                    refine_search_window=self._config.refine_search_window,
+                    cell_divide=self._config.cell_divide,
+                    cell_min_gap=self._config.cell_min_gap,
+                )
+                time_ranges, report = pipeline.run_full(
+                    video_path=self._video_path,
+                    annotations=self._annotations,
+                    start_frame=0, end_frame=self._total_frames - 1,
+                    progress_cb=lambda pct: self.progress.emit(pct),
+                    detected_cb=lambda ts, t: self.detected.emit(ts, t),
+                    raw_ocr_cb=lambda ts, t, l: self.raw_text.emit(ts, t, l),
+                    cancel_check=lambda: self._cancel_flag,
+                    gap_progress_cb=lambda pct: self.gap_progress.emit(pct),
+                )
+                self.finished.emit(time_ranges, report)
+            except Exception as e:
+                import traceback
+                self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+        def cancel(self):
+            self._cancel_flag = True
+
     def _run_detection_pipeline(self, detector, info, bar):
-        """在主线程直接运行 DetectionPipeline（避免子线程 OCR 失效）。"""
+        """在后台线程运行 DetectionPipeline，通过 signal 更新进度。"""
         self._log.debug("_run_detection_pipeline 入口")
-        from app.core.detector import DetectionPipeline
-        from PySide6.QtWidgets import QApplication
-
-        cpu_n = getattr(self._project.detection, 'cpu_workers', 3)
-        gpu_n = getattr(self._project.detection, 'gpu_workers', 2)
-        kwargs = self._project.detection.to_worker_kwargs()
-        self._log.debug("cpu_workers=%d, gpu_workers=%d, skip_frames=%d, mode=%s",
-                        cpu_n, gpu_n, kwargs.get('skip_frames', 0), kwargs.get('mode', '?'))
-
-        pipeline = DetectionPipeline(
-            self._matcher, detector,
-            cpu_workers=cpu_n, gpu_workers=gpu_n,
-            padding_before=kwargs.get('padding_before', 10.0),
-            padding_after=kwargs.get('padding_after', 10.0),
-            allowed_actors=kwargs.get('allowed_actors'),
-            skip_frames=kwargs.get('skip_frames', 3),
-            mode=kwargs.get('mode', 'time'),
-            interval_sec=kwargs.get('interval_sec', 1.0),
-        )
-
         self._cancel_flag = False
-
-        def prog_cb(pct):
-            bar.setValue(int(pct))
-            QApplication.processEvents()
-
-        def det_cb(ts, text):
-            self._on_ocr_detected(ts, text)
-            QApplication.processEvents()
-
+        self._pool_worker = self._PoolDetectWorker(
+            self._matcher, detector,
+            self._project.source.path, self._project.annotations,
+            info.total_frames, self._project.detection, self,
+        )
+        self._pool_worker.progress.connect(lambda pct: bar.setValue(int(pct * 10)))
+        if self._project.detection.cell_divide:
+            self._gap_bar.setVisible(True)
+            self._gap_bar.setValue(0)
+            self._pool_worker.gap_progress.connect(lambda pct: self._gap_bar.setValue(int(pct)))
+        self._pool_worker.detected.connect(self._on_ocr_detected)
+        self._pool_worker.raw_text.connect(self._on_raw_ocr_text)
+        self._pool_worker.finished.connect(self._on_pipeline_done)
+        self._pool_worker.error.connect(self._on_pipeline_error)
         self.statusBar().showMessage("启动 Pool 模式识别...")
-        self._log.debug("调用 pipeline.run_full...")
-        try:
-            time_ranges, report = pipeline.run_full(
-                video_path=self._project.source.path,
-                annotations=self._project.annotations,
-                start_frame=0, end_frame=info.total_frames - 1,
-                progress_cb=prog_cb,
-                detected_cb=det_cb,
-                raw_ocr_cb=lambda ts, t, l: self._on_raw_ocr_text(ts, t, l),
-                cancel_check=lambda: self._cancel_flag,
-            )
-        except Exception as e:
-            self._log.error("检测失败: %s", e)
-            import traceback
-            self._log.error(traceback.format_exc())
-            self._reset_detect_state()
-            return
+        self._pool_worker.start()
 
-        self._log.debug("pipeline.run_full 返回: %d 个 time_ranges", len(time_ranges))
+    def _on_pipeline_done(self, time_ranges, report):
+        self._log.debug("pipeline 完成: %d 个 time_ranges", len(time_ranges))
         all_clips = []
         for r in time_ranges:
             all_clips.append(ClipResult(
                 start_sec=r.start_sec, end_sec=r.end_sec,
                 action=r.action, actor=r.actor,
                 pattern_id=r.pattern_id, source=r.source))
-        self._log.debug("构建 %d 个 ClipResult", len(all_clips))
-
-        if self._project.detection.refine_boundaries and all_clips:
-            try:
-                self._log.debug("后处理: 边界精化...")
-                all_clips = self._refine_boundaries(all_clips)
-            except Exception as e:
-                self._log.error("边界精化失败 (跳过): %s", e)
-        if self._project.detection.cell_divide and all_clips:
-            try:
-                self._log.debug("后处理: 细胞分裂...")
-                all_clips = self._cell_divide_events(all_clips)
-            except Exception as e:
-                self._log.error("细胞分裂失败 (跳过): %s", e)
 
         if all_clips:
             all_clips.sort(key=lambda c: c.start_sec)
             self._project.set_results(all_clips)
-            self._log.debug("set_results(%d clips)", len(all_clips))
 
         if report:
             self._thread_reports[0] = report
-            self._log.debug("report saved to _thread_reports[0]")
 
         try:
-            self._log.debug("调用 _save_detection_report...")
             self._save_detection_report(all_clips)
-            self._log.debug("_save_detection_report 完成")
         except Exception as e:
             self._log.error("保存检测报告异常: %s", e)
 
-        self._log.debug("重置 UI 状态...")
         self._ocr_detecting = False
         self._detect_btn.setText("开始识别")
         self._detect_btn.setEnabled(True)
         self._progress_widget.setVisible(False)
         self._show_results()
-        self.statusBar().showMessage(
-            f"识别完成! {len(all_clips)} 个高光片段")
+        self.statusBar().showMessage(f"识别完成! {len(all_clips)} 个高光片段")
         self._log.info("检测流程完成: %d 个片段", len(all_clips))
+
+    def _on_pipeline_error(self, msg):
+        self._log.error("检测失败: %s", msg)
+        self._reset_detect_state()
 
     def _cancel_detection(self):
         self._cancel_flag = True
+        if hasattr(self, '_pool_worker') and self._pool_worker:
+            self._pool_worker.cancel()
         for w in self._ocr_threads:
             w.cancel()
         self._progress_widget.setVisible(False)
@@ -518,6 +532,7 @@ class MainWindow(QMainWindow):
         self._ocr_detecting = False
         self._detect_btn.setText("开始识别")
         self._detect_btn.setEnabled(True)
+        self._gap_bar.setVisible(False)
 
     def _on_ocr_progress(self, tid: int, pct: float):
         if tid < len(self._thread_bars):
@@ -536,9 +551,6 @@ class MainWindow(QMainWindow):
 
     def _on_ocr_detected(self, timestamp: float, text: str):
         self._detect_hit_count += 1
-        short = text[:25] + "..." if len(text) > 25 else text
-        self._detect_count_label.setText(
-            f"已检测到: {self._detect_hit_count} | [{timestamp:.1f}s] {short}")
 
     def _on_raw_ocr_text(self, timestamp: float, text: str, label: str):
         if not text or not text.strip():
@@ -589,7 +601,8 @@ class MainWindow(QMainWindow):
         from app.core.player import VideoPlayer
         import numpy as np
 
-        detector = OCRDetector(gpu=self._project.detection.gpu)
+        detector = OCRDetector(gpu=self._project.detection.gpu,
+                               engine=self._project.detection.ocr_engine)
         detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
 
         player = VideoPlayer()

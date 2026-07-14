@@ -53,6 +53,8 @@ class DetectionConfig:
     pipeline_mode: str = "pool"
     cpu_workers: int = 6
     gpu_workers: int = 4
+    gate_mode: str = "neural"
+    ocr_engine: str = "rapidocr"
     # 后处理参数（所有 pipeline_mode 通用）
     refine_boundaries: bool = False
     refine_search_window: float = 2.0
@@ -64,6 +66,7 @@ class DetectionConfig:
             "mode": self.mode,
             "interval_sec": self.interval_sec,
             "skip_frames": self.skip_frames,
+            "gate_mode": self.gate_mode,
             "post_detect_skip_sec": self.post_detect_skip_sec,
             "padding_before": self.padding_before,
             "padding_after": self.padding_after,
@@ -239,7 +242,7 @@ class Project:
                         for k in ("mode", "interval_sec", "skip_frames",
                                    "post_detect_skip_sec", "padding_before",
                                    "padding_after", "merge_gap", "num_threads",
-                                   "rotation"):
+                                   "rotation", "gate_mode"):
                             if k in det:
                                 setattr(cfg, k, det[k])
                         if "allowed_actors" in det and det["allowed_actors"]:
@@ -358,6 +361,7 @@ class Project:
                 "merge_gap": self.detection.merge_gap,
                 "num_threads": self.detection.num_threads,
                 "rotation": self.detection.rotation,
+                "gate_mode": self.detection.gate_mode,
                 "allowed_actors": (sorted(self.detection.allowed_actors)
                                    if self.detection.allowed_actors else None),
             },

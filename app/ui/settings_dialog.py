@@ -205,6 +205,15 @@ class SettingsDialog(QDialog):
             lambda v: setattr(self._detection, 'gpu_workers', v))
         form.addRow("GPU 线程", self._gpu_workers)
 
+        self._gate_combo = QComboBox()
+        self._gate_combo.addItem("像素门控", "pixel")
+        self._gate_combo.addItem("神经门控", "neural")
+        self._gate_combo.setToolTip("像素门控(<1ms): 白像素计数; 神经门控(5-10ms): EasyOCR CRAFT 检测")
+        self._gate_combo.currentIndexChanged.connect(
+            lambda i: setattr(self._detection, 'gate_mode',
+                              self._gate_combo.itemData(i)))
+        form.addRow("门控模式", self._gate_combo)
+
         return form
 
     # ---- 时间页面 ----
@@ -349,6 +358,11 @@ class SettingsDialog(QDialog):
         self._gpu_workers.setEnabled(is_pool)
         self._gpu_workers.blockSignals(False)
 
+        self._gate_combo.blockSignals(True)
+        gate_idx = 0 if d.gate_mode == "pixel" else 1
+        self._gate_combo.setCurrentIndex(gate_idx)
+        self._gate_combo.blockSignals(False)
+
         self._padding.blockSignals(True)
         self._padding.setValue(d.padding_before)
         self._padding.blockSignals(False)
@@ -404,6 +418,7 @@ class SettingsDialog(QDialog):
         det.refine_search_window = float(d.get("refine_search_window", 2.0))
         det.cell_divide = bool(d.get("cell_divide", False))
         det.cell_min_gap = float(d.get("cell_min_gap", 2.0))
+        det.gate_mode = d.get("gate_mode", "neural")
         self._sync_controls()
 
     def _write_defaults(self):
@@ -430,6 +445,7 @@ class SettingsDialog(QDialog):
             "refine_search_window": det.refine_search_window,
             "cell_divide": det.cell_divide,
             "cell_min_gap": det.cell_min_gap,
+            "gate_mode": det.gate_mode,
         }
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False,

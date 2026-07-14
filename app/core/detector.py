@@ -158,6 +158,74 @@ class RunSummary:
         }
 
 
+class FrameLogger:
+    """共享帧日志 —— Pool / Legacy / 后处理共用。
+
+    - 线程安全：Pool 模式多个 GPUWorker 并发写入。
+    - populate(report) 将收集的数据写入 DetectionReport。
+    """
+
+    def __init__(self, video_fps: float = 30.0):
+        import threading
+        self._lock = threading.Lock()
+        self._video_fps = video_fps
+        self.frames: list[FrameLog] = []
+        self.counter_events: list[dict] = []
+        self.dropped: list[DroppedRecord] = []
+        self._counter_value: int = -1
+
+    def log_sample(self, timestamp: float, roi_label: str, roi_id: int,
+                   ocr_text: str = "", ocr_confidence: float = 0.0,
+                   match_hit: bool = False, match_pattern_id: str = "",
+                   match_action: str = "", match_actor: str = "",
+                   stage: str = "ocr"):
+        fl = FrameLog(
+            frame_number=int(timestamp * self._video_fps),
+            timestamp=round(timestamp, 2), roi_id=roi_id, roi_label=roi_label,
+            stage=stage, ocr_text=ocr_text, ocr_confidence=ocr_confidence,
+            match_hit=match_hit, match_pattern_id=match_pattern_id,
+            match_action=match_action, match_actor=match_actor,
+        )
+        with self._lock:
+            self.frames.append(fl)
+
+    def log_counter(self, timestamp: float, value: int, delta: int,
+                    raw_text: str = "", drop_reason: str = ""):
+        fl = FrameLog(
+            frame_number=int(timestamp * self._video_fps),
+            timestamp=round(timestamp, 2), roi_id=0, roi_label="淘汰计数",
+            stage="counter_track", ocr_text=raw_text, ocr_confidence=0.0,
+            counter_value=value, counter_delta=delta,
+            dropped=bool(drop_reason), drop_reason=drop_reason,
+        )
+        with self._lock:
+            self.frames.append(fl)
+            if drop_reason:
+                self.dropped.append(DroppedRecord(
+                    frame_number=fl.frame_number, timestamp=timestamp,
+                    roi_label="淘汰计数", ocr_text=raw_text, ocr_confidence=0.0,
+                    reason=drop_reason, detail=f"raw_text='{raw_text}'",
+                ))
+            if delta > 0:
+                self.counter_events.append({
+                    "timestamp": round(timestamp, 2), "delta": delta,
+                    "new_count": value,
+                })
+            self._counter_value = value
+
+    def populate(self, report: "DetectionReport") -> None:
+        with self._lock:
+            report.frames_log = list(self.frames)
+            report.dropped = list(self.dropped)
+            report.counter_events = list(self.counter_events)
+        s = report.summary
+        s.counter_total_events = len(self.counter_events)
+        s.counter_total_delta = sum(e.get("delta", 0) for e in self.counter_events)
+        s.dropped_total = len(self.dropped)
+        s.frames_with_ocr_hits = sum(1 for f in self.frames if f.match_hit)
+        s.frames_with_matches = s.frames_with_ocr_hits
+
+
 class DetectionReport:
     """一次检测运行的完整报告"""
 
@@ -425,29 +493,89 @@ class TextFusionBuffer:
 
 
 class OCRDetector:
-    """OCR 检测器 —— GPU 调用通过类级锁保证线程安全"""
+    """OCR 检测器 —— 支持 EasyOCR / RapidOCR 双引擎。
+
+    GPU 调用通过类级锁保证线程安全（EasyOCR），RapidOCR 的 ONNX Runtime 本身线程安全。
+    """
 
     _gpu_lock = threading.Lock()
 
-    def __init__(self, gpu: bool = True, languages: list[str] | None = None):
+    def __init__(self, gpu: bool = True, languages: list[str] | None = None,
+                 engine: str = "rapidocr"):
         if languages is None:
             languages = ["ch_sim", "en"]
-        self._reader = ModelManager().get_easyocr_reader(gpu=gpu, languages=languages)
+        self._engine_type = engine
         self._gpu = gpu
+        self._languages = languages
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
+    @property
+    def _engine(self):
+        """每次访问通过 ModelManager 获取线程本地引擎实例。"""
+        return ModelManager().get_engine(self._engine_type, gpu=self._gpu,
+                                         languages=self._languages)
+
+    # ── 公共接口 ──
+
     def detect(self, roi_image: np.ndarray) -> list[OCRResult]:
+        """对 ROI 图像做 OCR，返回识别结果列表。"""
         if roi_image is None or roi_image.size == 0:
             return []
-        return self.detect_raw(self._preprocess(roi_image))
+        if self._engine_type == "rapidocr":
+            return self._detect_rapidocr(roi_image)
+        return self._detect_easyocr(roi_image)
 
     def detect_raw(self, preprocessed: np.ndarray) -> list[OCRResult]:
-        """直接对已预处理的图像做 GPU OCR，跳过预处理"""
+        """对已预处理的图像做 OCR（EasyOCR 路径保留 CLAHE，RapidOCR 路径等同 detect）。"""
         if preprocessed is None or preprocessed.size == 0:
             return []
+        if self._engine_type == "rapidocr":
+            return self._detect_rapidocr(preprocessed)
+        return self._detect_easyocr(preprocessed)
+
+    def has_text(self, roi_image: np.ndarray) -> bool:
+        """快速判断 ROI 内是否有文字（神经门控）。
+
+        RapidOCR: 仅检测 → 返回 bool。
+        EasyOCR: CRAFT 文本区域检测（不做识别）
+        """
+        if roi_image is None or roi_image.size == 0:
+            return False
+        if self._engine_type == "rapidocr":
+            result = self._engine(roi_image, use_det=True, use_cls=False, use_rec=False)
+            return result.boxes is not None and len(result.boxes) > 0
+        h_list, f_list = self._engine.detect(roi_image)
+        h_list = h_list[0] if h_list else []
+        f_list = f_list[0] if f_list else []
+        return (len(h_list) + len(f_list)) > 0
+
+    # ── RapidOCR ──
+
+    def _detect_rapidocr(self, roi_image: np.ndarray) -> list[OCRResult]:
+        """RapidOCR 推理 —— 每线程独立引擎，无需全局锁。"""
+        result = self._engine(roi_image, use_det=True, use_cls=True, use_rec=True)
+        if result.boxes is None or len(result.boxes) == 0:
+            return []
+        results: list[OCRResult] = []
+        for box, text, score in zip(result.boxes, result.txts, result.scores):
+            if score < 0.3:
+                continue
+            x1 = int(round(box[0][0].item() if hasattr(box[0][0], 'item') else box[0][0]))
+            y1 = int(round(box[0][1].item() if hasattr(box[0][1], 'item') else box[0][1]))
+            x2 = int(round(box[2][0].item() if hasattr(box[2][0], 'item') else box[2][0]))
+            y2 = int(round(box[2][1].item() if hasattr(box[2][1], 'item') else box[2][1]))
+            results.append(OCRResult(text.strip(), round(float(score), 4),
+                                     (x1, y1, x2 - x1, y2 - y1)))
+        return results
+
+    # ── EasyOCR ──
+
+    def _detect_easyocr(self, roi_image: np.ndarray) -> list[OCRResult]:
+        """EasyOCR 推理 —— CLAHE 预处理 → readtext。"""
+        prepped = self._preprocess(roi_image)
         with self._gpu_lock:
             try:
-                raw = self._reader.readtext(preprocessed)
+                raw = self._engine.readtext(prepped)
             except Exception:
                 return []
         results: list[OCRResult] = []
@@ -456,7 +584,8 @@ class OCRDetector:
                 continue
             x1, y1 = int(bbox[0][0]), int(bbox[0][1])
             x2, y2 = int(bbox[2][0]), int(bbox[2][1])
-            results.append(OCRResult(text.strip(), round(float(conf), 4), (x1, y1, x2 - x1, y2 - y1)))
+            results.append(OCRResult(text.strip(), round(float(conf), 4),
+                                     (x1, y1, x2 - x1, y2 - y1)))
         return results
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
@@ -672,6 +801,7 @@ class DetectionEngine:
         self.burst_interval_sec = burst_interval_sec
         self.burst_window_sec = burst_window_sec
         self._counter = CounterTracker()
+        self._frame_logger = FrameLogger()
         self._report: DetectionReport | None = None
         self._config_meta: dict = {}
         self._fusion_buffer = TextFusionBuffer()
@@ -688,6 +818,7 @@ class DetectionEngine:
                 video_fps=video_info.fps, video_duration_sec=duration,
                 config=self._config_meta, rois=roi_dicts,
             )
+            self._frame_logger = FrameLogger(video_fps=video_info.fps)
         return self._report
 
     def _log_counter(self, timestamp: float, stage: str, value: int, delta: int,
@@ -730,8 +861,10 @@ class DetectionEngine:
             roi_id = self._roi_id(roi, i)
             if label == '淘汰计数':
                 for ocr_r in self._detector.detect(roi_img):
-                    self._counter.feed(timestamp, ocr_r.text,
-                                       log_cb=self._log_counter)
+                    old = self._counter._count
+                    new = self._counter.feed(timestamp, ocr_r.text)
+                    self._frame_logger.log_counter(
+                        timestamp, new, new - old, ocr_r.text)
                     if raw_ocr_cb:
                         raw_ocr_cb(timestamp, ocr_r.text, label)
             else:
@@ -826,8 +959,10 @@ class DetectionEngine:
                 if not process_counter:
                     continue
                 for ocr_r in self._detector.detect_raw(roi_img):
-                    self._counter.feed(timestamp, ocr_r.text,
-                                       log_cb=self._log_counter)
+                    old = self._counter._count
+                    new = self._counter.feed(timestamp, ocr_r.text)
+                    self._frame_logger.log_counter(
+                        timestamp, new, new - old, ocr_r.text)
                     if raw_ocr_cb:
                         raw_ocr_cb(timestamp, ocr_r.text, label)
             else:
@@ -902,26 +1037,13 @@ class DetectionEngine:
     def _log_keyword(self, timestamp: float, fn: int, roi_id: int, label: str,
                      ocr_text: str, ocr_conf: float, match,
                      prefix_ok: bool, drop_reason: str):
-        if self._report is None:
-            return
-        fl = FrameLog(
-            frame_number=fn, timestamp=timestamp, roi_id=roi_id, roi_label=label,
-            stage="keyword_match" if match else "ocr",
-            ocr_text=ocr_text, ocr_confidence=round(ocr_conf, 4),
+        self._frame_logger.log_sample(
+            timestamp, label, roi_id, ocr_text, round(ocr_conf, 4),
             match_hit=match is not None,
             match_pattern_id=match.pattern_id if match else "",
             match_action=match.action if match else "",
             match_actor=match.actor if match else "",
-            dropped=bool(drop_reason), drop_reason=drop_reason,
-        )
-        self._report.frames_log.append(fl)
-        if drop_reason:
-            self._report.dropped.append(DroppedRecord(
-                frame_number=fn, timestamp=timestamp, roi_label=label,
-                ocr_text=ocr_text, ocr_confidence=round(ocr_conf, 4),
-                reason=drop_reason,
-                detail=f"prefix_ok={prefix_ok}" if drop_reason == "no_trigger_prefix" else "",
-            ))
+            stage="keyword_match" if match else "ocr")
 
     def run_full(self, video_path: str, annotations, start_frame: int = 0,
                  end_frame: int | None = None,
@@ -1075,6 +1197,7 @@ class DetectionEngine:
     def _build_summary(self, stack: EventStackEngine, merged: list, elapsed: float):
         if self._report is None:
             return
+        self._frame_logger.populate(self._report)
         s = self._report.summary
         s.elapsed_seconds = elapsed
         s.detections_before_merge = stack.total_pushed
@@ -1126,16 +1249,16 @@ class DetectionEngine:
         merged: list[DetectionResult] = [sorted_r[0]]
         for r in sorted_r[1:]:
             last = merged[-1]
-            if r.start_sec <= last.end_sec:
-                # 重叠：扩展结束时间，合并标签
+            same_key = (r.action == last.action and r.actor == last.actor)
+            if r.start_sec <= last.end_sec and same_key:
                 merged[-1] = DetectionResult(
                     start_sec=last.start_sec,
                     end_sec=max(last.end_sec, r.end_sec),
-                    action=f"{last.action}+{r.action}" if r.action != last.action else last.action,
-                    actor=f"{last.actor}+{r.actor}" if r.actor != last.actor else last.actor,
-                    pattern_id=f"{last.pattern_id}+{r.pattern_id}" if r.pattern_id != last.pattern_id else last.pattern_id,
+                    action=last.action,
+                    actor=last.actor,
+                    pattern_id=last.pattern_id,
                     match_count=last.match_count + r.match_count,
-                    source="merged" if last.source != r.source else last.source,
+                    source=last.source,
                 )
             else:
                 merged.append(r)
@@ -1157,7 +1280,8 @@ class CPUWorker(threading.Thread):
     def __init__(self, video_path: str, rois: list, fps: float,
                  detector: "OCRDetector", kill_roi_index: int,
                  frame_req_queue, prepped_queue, result_queue,
-                 text_gate: "TextPresenceGate" = None):
+                 text_gate: "TextPresenceGate" = None,
+                 gate_mode: str = "pixel"):
         super().__init__(daemon=True)
         self._video_path = video_path
         self._rois = rois
@@ -1168,6 +1292,7 @@ class CPUWorker(threading.Thread):
         self._prepped = prepped_queue
         self._result = result_queue
         self._gate = text_gate or TextPresenceGate()
+        self._gate_mode = gate_mode
         self._running = False
 
     def run(self):
@@ -1192,25 +1317,36 @@ class CPUWorker(threading.Thread):
                     if frame is None:
                         self._result.put((fn, ts, None))
                         continue
-                    roi = self._rois[self._kill_roi_index]
-                    if hasattr(roi, 'x'):
-                        ki = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
+                    if self._gate_mode == "neural":
+                        prepped = []
+                        for r in self._rois:
+                            if hasattr(r, 'x'):
+                                ri = frame[r.y:r.y + r.h, r.x:r.x + r.w]
+                            else:
+                                ri = frame[r['y']:r['y'] + r['h'],
+                                          r['x']:r['x'] + r['w']]
+                            prepped.append((self._detector._preprocess(ri), r))
+                        self._prepped.put((fn, prepped, ts, True))
                     else:
-                        ki = frame[roi['y']:roi['y'] + roi['h'],
-                                   roi['x']:roi['x'] + roi['w']]
-                    has_text, is_new = self._gate.check(ki)
-                    if not has_text:
-                        self._result.put((fn, ts, None))
-                        continue
-                    prepped = []
-                    for r in self._rois:
-                        if hasattr(r, 'x'):
-                            ri = frame[r.y:r.y + r.h, r.x:r.x + r.w]
+                        roi = self._rois[self._kill_roi_index]
+                        if hasattr(roi, 'x'):
+                            ki = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
                         else:
-                            ri = frame[r['y']:r['y'] + r['h'],
-                                      r['x']:r['x'] + r['w']]
-                        prepped.append((self._detector._preprocess(ri), r))
-                    self._prepped.put((fn, prepped, ts, is_new))
+                            ki = frame[roi['y']:roi['y'] + roi['h'],
+                                       roi['x']:roi['x'] + roi['w']]
+                        has_text, is_new = self._gate.check(ki)
+                        if not has_text:
+                            self._result.put((fn, ts, None))
+                            continue
+                        prepped = []
+                        for r in self._rois:
+                            if hasattr(r, 'x'):
+                                ri = frame[r.y:r.y + r.h, r.x:r.x + r.w]
+                            else:
+                                ri = frame[r['y']:r['y'] + r['h'],
+                                          r['x']:r['x'] + r['w']]
+                            prepped.append((self._detector._preprocess(ri), r))
+                        self._prepped.put((fn, prepped, ts, is_new))
                 except Exception:
                     self._result.put((fn, 0.0, None))
         finally:
@@ -1238,7 +1374,8 @@ class GPUWorker(threading.Thread):
                  counter: "CounterTracker" = None,
                  counter_event_cb=None,
                  allowed_actors: set = None,
-                 raw_ocr_cb=None):
+                 raw_ocr_cb=None, logger: "FrameLogger" = None,
+                 gate_mode: str = "pixel"):
         super().__init__(daemon=True)
         self._detector = detector
         self._matcher = matcher
@@ -1249,6 +1386,8 @@ class GPUWorker(threading.Thread):
             self._counter.on_event = counter_event_cb
         self.allowed_actors = allowed_actors
         self._raw_ocr_cb = raw_ocr_cb
+        self._logger = logger
+        self._gate_mode = gate_mode
         self._fusion = TextFusionBuffer()
         self._running = False
 
@@ -1269,19 +1408,43 @@ class GPUWorker(threading.Thread):
                 self._result_queue.put((fn, ts, None))
 
     def _match(self, prepped_rois, timestamp, fn):
+        if self._gate_mode == "neural":
+            for roi_idx, (roi_img, roi) in enumerate(prepped_rois):
+                label = (getattr(roi, 'label', '') if hasattr(roi, 'label')
+                         else roi.get('label', ''))
+                if label == '击杀信息':
+                    if not self._detector.has_text(roi_img):
+                        if self._logger:
+                            self._logger.log_sample(
+                                timestamp, label, roi_idx,
+                                ocr_text="", stage="gate_neural")
+                        return None
+                    if self._logger:
+                        self._logger.log_sample(
+                            timestamp, label, roi_idx,
+                            ocr_text="text detected",
+                            stage="gate_neural")
+                    break
         frame_matched = None
-        for roi_img, roi in prepped_rois:
+        for roi_idx, (roi_img, roi) in enumerate(prepped_rois):
             label = (getattr(roi, 'label', '') if hasattr(roi, 'label')
                      else roi.get('label', ''))
             if label == '淘汰计数':
                 for ocr_r in self._detector.detect_raw(roi_img):
-                    self._counter.feed(timestamp, ocr_r.text)
+                    old_count = self._counter._count
+                    new_count = self._counter.feed(timestamp, ocr_r.text)
+                    if self._logger:
+                        self._logger.log_counter(
+                            timestamp, new_count, new_count - old_count, ocr_r.text)
                     if self._raw_ocr_cb:
                         self._raw_ocr_cb(timestamp, ocr_r.text, label)
             else:
                 ocr_results = self._detector.detect_raw(roi_img)
-                if not ocr_results:
-                    continue
+                # 记录所有 OCR 文本
+                if self._logger:
+                    for ocr_r in ocr_results:
+                        self._logger.log_sample(
+                            timestamp, label, roi_idx, ocr_r.text, ocr_r.confidence)
                 if len(ocr_results) > 1:
                     sorted_r = sorted(ocr_results, key=lambda r: r.bbox[0])
                     joined = "".join(r.text for r in sorted_r)
@@ -1289,8 +1452,15 @@ class GPUWorker(threading.Thread):
                     if jm and (self.allowed_actors is None or jm.actor in self.allowed_actors):
                         self._fusion.feed(timestamp, joined,
                                           min(r.confidence for r in ocr_results))
-                        for ocr_r in ocr_results:
-                            if self._raw_ocr_cb:
+                        if self._logger:
+                            self._logger.log_sample(
+                                timestamp, label, roi_idx, joined,
+                                min(r.confidence for r in ocr_results),
+                                match_hit=True, match_pattern_id=jm.pattern_id,
+                                match_action=jm.action, match_actor=jm.actor,
+                                stage="match")
+                        if self._raw_ocr_cb:
+                            for ocr_r in ocr_results:
                                 self._raw_ocr_cb(timestamp, ocr_r.text, label)
                         if frame_matched is None:
                             frame_matched = jm
@@ -1304,6 +1474,12 @@ class GPUWorker(threading.Thread):
                         if (self.allowed_actors is not None
                                 and match.actor not in self.allowed_actors):
                             continue
+                        if self._logger:
+                            self._logger.log_sample(
+                                timestamp, label, roi_idx, ocr_r.text, ocr_r.confidence,
+                                match_hit=True, match_pattern_id=match.pattern_id,
+                                match_action=match.action, match_actor=match.actor,
+                                stage="match")
                         if frame_matched is None:
                             frame_matched = match
                     else:
@@ -1315,6 +1491,12 @@ class GPUWorker(threading.Thread):
                                 if (self.allowed_actors is not None
                                         and fm.actor not in self.allowed_actors):
                                     continue
+                                if self._logger:
+                                    self._logger.log_sample(
+                                        timestamp, label, roi_idx, fused, 0.0,
+                                        match_hit=True, match_pattern_id=fm.pattern_id,
+                                        match_action=fm.action, match_actor=fm.actor,
+                                        stage="fusion")
                                 if frame_matched is None:
                                     frame_matched = fm
         return frame_matched
@@ -1339,7 +1521,12 @@ class DetectionPipeline:
                  allowed_actors: set = None,
                  wait_after: dict = None,
                  skip_frames: int = 60,
-                 mode: str = "time", interval_sec: float = 1.0):
+                 mode: str = "time", interval_sec: float = 1.0,
+                 gate_mode: str = "pixel",
+                 refine_boundaries: bool = False,
+                 refine_search_window: float = 2.0,
+                 cell_divide: bool = False,
+                 cell_min_gap: float = 2.0):
         self._matcher = matcher
         self._detector = detector
         self._cpu_n = cpu_workers
@@ -1352,12 +1539,18 @@ class DetectionPipeline:
         self._skip_frames = skip_frames
         self._mode = mode
         self._interval_sec = interval_sec
+        self._gate_mode = gate_mode
+        self._refine_boundaries = refine_boundaries
+        self._refine_search_window = refine_search_window
+        self._cell_divide = cell_divide
+        self._cell_min_gap = cell_min_gap
         self._config_meta: dict = {}
 
     def run_full(self, video_path: str, annotations,
                  start_frame: int = 0, end_frame: int = None,
                  progress_cb=None, detected_cb=None,
-                 raw_ocr_cb=None, cancel_check=None):
+                 raw_ocr_cb=None, cancel_check=None,
+                 gap_progress_cb=None):
         import queue
         from app.core.player import VideoPlayer
 
@@ -1382,6 +1575,11 @@ class DetectionPipeline:
             "merge_gap": self.merge_gap,
             "mode": self._mode, "interval_sec": self._interval_sec,
             "skip_frames": self._skip_frames,
+            "gate_mode": self._gate_mode,
+            "refine_boundaries": self._refine_boundaries,
+            "refine_search_window": self._refine_search_window,
+            "cell_divide": self._cell_divide,
+            "cell_min_gap": self._cell_min_gap,
         }
 
         if not rois:
@@ -1402,7 +1600,8 @@ class DetectionPipeline:
         result_q = queue.Queue()
 
         cpu_pool = [CPUWorker(video_path, rois, fps, self._detector,
-                              kill_idx, frame_req, prepped_q, result_q)
+                              kill_idx, frame_req, prepped_q, result_q,
+                              gate_mode=self._gate_mode)
                     for _ in range(self._cpu_n)]
         for w in cpu_pool:
             w.start()
@@ -1413,12 +1612,15 @@ class DetectionPipeline:
             padding_after=self.padding_after,
         ))
 
+        frame_logger = FrameLogger(video_fps=fps)
         gpu_pool = [GPUWorker(self._detector, self._matcher,
                               prepped_q, result_q,
                               CounterTracker() if i == 0 else None,
                               counter_event_cb=stack.push if i == 0 else None,
                               allowed_actors=self.allowed_actors,
-                              raw_ocr_cb=raw_ocr_cb if i == 0 else None)
+                              raw_ocr_cb=raw_ocr_cb,
+                              logger=frame_logger,
+                              gate_mode=self._gate_mode)
                     for i in range(self._gpu_n)]
         for w in gpu_pool:
             w.start()
@@ -1472,17 +1674,75 @@ class DetectionPipeline:
 
             if progress_cb:
                 pct = (next_idx / total) * 100
-                progress_cb(min(pct, 100.0))
+                progress_cb(min(pct, 85.0))
 
+        for w in cpu_pool:
+            w.stop()
         for w in cpu_pool:
             w.stop()
         for w in gpu_pool:
             w.stop()
 
-        elapsed = time.time() - _t0
         results = stack.flush()
         results = DetectionEngine._merge_overlapping(results)
 
+        # ── 后处理: gap_binary_search 精确边界 (85-95%) ──
+        if self._cell_divide and results:
+            from app.core.coarse_to_fine import gap_binary_search, _extract_coarse_hits
+            _log.info("细胞分裂(gap): 从 FrameLogger 提取粗扫命中...")
+            coarse_hits = _extract_coarse_hits(frame_logger)
+            _log.info("细胞分裂(gap): 提取到 %d 个粗扫命中点", len(coarse_hits))
+            if coarse_hits:
+                precise = gap_binary_search(
+                    video_path, rois, kill_idx, fps,
+                    coarse_hits,
+                    search_window=self._refine_search_window,
+                    cancel_check=cancel_check,
+                    raw_ocr_cb=raw_ocr_cb,
+                    progress_cb=gap_progress_cb,
+                )
+                _log.info("细胞分裂(gap): 完成 (%d 个精确事件)", len(precise))
+                # 添加 padding
+                for r in precise:
+                    r.start_sec = max(0.0, r.start_sec - self.padding_before)
+                    r.end_sec = r.end_sec + self.padding_after
+                # 合并重叠或相近的事件
+                precise.sort(key=lambda r: r.start_sec)
+                results = []
+                for r in precise:
+                    if not results:
+                        results.append(r)
+                    elif (r.start_sec - results[-1].end_sec <= self.merge_gap
+                          and r.action == results[-1].action
+                          and r.actor == results[-1].actor):
+                        results[-1].end_sec = max(results[-1].end_sec, r.end_sec)
+                    else:
+                        results.append(r)
+                _log.info("细胞分裂(gap): padding+合并后 %d 个片段", len(results))
+                if detected_cb:
+                    for r in precise:
+                        detected_cb(r.start_sec, f"{r.actor}:{r.action}")
+            else:
+                _log.warning("细胞分裂(gap): 无粗扫命中点，跳过")
+
+        # ── 边界精化 (仅当 cell_divide 关闭但 refine 开启时) ──
+        if self._refine_boundaries and results and not self._cell_divide:
+            from app.core.coarse_to_fine import BoundaryRefiner
+            _log.info("边界精化: 开始 (%d 个片段)", len(results))
+            refiner = BoundaryRefiner(video_path, rois, kill_idx)
+            n = len(results)
+            refined = []
+            for i, r in enumerate(results):
+                if cancel_check and cancel_check():
+                    refined.append(r); continue
+                refined.append(refiner.refine(r, fps,
+                    search_window=self._refine_search_window))
+                if progress_cb:
+                    progress_cb(85 + (i + 1) / max(n, 1) * 10)
+            results = refined
+            _log.info("边界精化: 完成 (%d 个片段)", len(results))
+
+        elapsed = time.time() - _t0
         report = DetectionReport(
             video_path=video_path,
             video_width=info.width, video_height=info.height,
@@ -1492,7 +1752,9 @@ class DetectionPipeline:
             rois=[{"id": i, "label": getattr(r, 'label', str(r))}
                   for i, r in enumerate(rois)],
         )
+        frame_logger.populate(report)
         s = report.summary
+        s.total_frames = total
         s.elapsed_seconds = elapsed
         s.detections_before_merge = stack.total_pushed
         s.detections_after_merge = len(results)
@@ -1502,6 +1764,8 @@ class DetectionPipeline:
              "pattern_id": r.pattern_id, "source": r.source}
             for r in results
         ]
+        if progress_cb:
+            progress_cb(100)
         _log.info("run_full 完成: %d results, %.1fs elapsed, pushed=%d",
                   len(results), elapsed, stack.total_pushed)
         return results, report

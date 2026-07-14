@@ -10,12 +10,13 @@ ocr:
   - en
   confidence_threshold: 0.5
 detection:
+  ocr_engine: rapidocr
   mode: time
   interval_sec: 1.0
-  skip_frames: 100
+  skip_frames: 3
   post_detect_skip_sec: 0.3
-  padding_before: 5.0
-  padding_after: 5.0
+  padding_before: 10.0
+  padding_after: 10.0
   merge_gap: 30.0
   num_threads: 1
   rotation: 0
@@ -24,8 +25,9 @@ detection:
   gpu_workers: 4
   refine_boundaries: false
   refine_search_window: 2.0
-  cell_divide: false
+  cell_divide: true
   cell_min_gap: 2.0
+  gate_mode: pixel
 event_stack:
   wait_after:
     淘汰: 10.0
