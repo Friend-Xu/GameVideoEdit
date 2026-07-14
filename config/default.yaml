@@ -42,6 +42,7 @@ export:
   default_encoder: auto
   output_format: mp4
   quality: 23
+  reencode: false
 ui:
   theme: light
   language: zh_CN

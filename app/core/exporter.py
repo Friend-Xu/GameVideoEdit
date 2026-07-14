@@ -32,6 +32,7 @@ class ExportConfig:
     quality: int = 23
     preset: str = "fast"
     use_gpu: bool = True
+    reencode: bool = False
 
 
 @dataclass
@@ -90,12 +91,29 @@ class VideoExporter:
         except Exception:
             return False
 
+    @staticmethod
+    def _merge_overlapping_ranges(ranges: list[TimeRange]) -> list[TimeRange]:
+        if len(ranges) <= 1:
+            return list(ranges)
+        sorted_ranges = sorted(ranges, key=lambda tr: tr.start_sec)
+        merged: list[TimeRange] = []
+        current = sorted_ranges[0]
+        for tr in sorted_ranges[1:]:
+            if tr.start_sec <= current.end_sec:
+                current = TimeRange(current.start_sec, max(current.end_sec, tr.end_sec))
+            else:
+                merged.append(current)
+                current = tr
+        merged.append(current)
+        return merged
+
     def combine_clips(
         self, video_path: str, clip_ranges: list[TimeRange],
         config: ExportConfig,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> ExportResult:
+        clip_ranges = self._merge_overlapping_ranges(clip_ranges)
         if not clip_ranges:
             return ExportResult(success=False, message="没有可导出的片段")
         if not self._has_ffmpeg(config.ffmpeg_path):
@@ -119,10 +137,16 @@ class VideoExporter:
                 cp = Path(self._temp_dir) / f"clip_{i:03d}.mp4"
                 _log.debug("切割片段 %d/%d: [%.1f-%.1f] dur=%.1f", i+1, total,
                            tr.start_sec, tr.end_sec, tr.end_sec - tr.start_sec)
-                ok, err = self._cut_reencode(video_path, tr, cp, config)
-                if not ok:
-                    _log.warning("片段 %d reencode 失败: %s, 尝试 stream copy", i+1, err[:100])
+                if config.reencode:
+                    ok, err = self._cut_reencode(video_path, tr, cp, config)
+                    if not ok:
+                        _log.warning("片段 %d reencode 失败: %s, 尝试 stream copy", i+1, err[:100])
+                        ok, err = self._cut_clip(video_path, tr, cp, config)
+                else:
                     ok, err = self._cut_clip(video_path, tr, cp, config)
+                    if not ok:
+                        _log.warning("片段 %d stream copy 失败: %s, 尝试 reencode", i+1, err[:100])
+                        ok, err = self._cut_reencode(video_path, tr, cp, config)
                 if ok:
                     clip_paths.append(cp)
                     self._temp_files.append(cp)
