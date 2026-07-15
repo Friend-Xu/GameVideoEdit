@@ -377,6 +377,7 @@ class BoundaryRefiner:
 
         return DetectionResult(
             start_sec=new_start, end_sec=new_end,
+            raw_start_sec=result.raw_start_sec, raw_end_sec=result.raw_end_sec,
             action=result.action, actor=result.actor,
             pattern_id=result.pattern_id, match_count=result.match_count,
             source=result.source,
@@ -549,6 +550,7 @@ def gap_binary_search(video_path: str, pixel_rois: list, kill_roi_index: int,
 
             events.append(DetectionResult(
                 start_sec=start, end_sec=end,
+                raw_start_sec=start, raw_end_sec=end,
                 action=hit.get('action', ''),
                 actor=hit.get('actor', ''),
                 pattern_id=hit.get('pattern_id', ''),
@@ -653,6 +655,7 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
 
                 events.append(DetectionResult(
                     start_sec=new_start, end_sec=new_end,
+                    raw_start_sec=new_start, raw_end_sec=new_end,
                     action=match.action, actor=match.actor,
                     pattern_id=match.pattern_id, source="text",
                 ))
@@ -715,6 +718,8 @@ def _merge_overlapping_events(events: list[DetectionResult]) -> list[DetectionRe
             merged[-1] = DetectionResult(
                 start_sec=min(last.start_sec, r.start_sec),
                 end_sec=max(last.end_sec, r.end_sec),
+                raw_start_sec=min(last.raw_start_sec, r.raw_start_sec),
+                raw_end_sec=max(last.raw_end_sec, r.raw_end_sec),
                 action=f"{last.action}+{r.action}" if r.action != last.action else last.action,
                 actor=f"{last.actor}+{r.actor}" if r.actor != last.actor else last.actor,
                 pattern_id=f"{last.pattern_id}+{r.pattern_id}" if r.pattern_id != last.pattern_id else last.pattern_id,

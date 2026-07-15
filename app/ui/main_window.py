@@ -293,8 +293,15 @@ class MainWindow(QMainWindow):
         det.ocr_engine = d.get("ocr_engine", "rapidocr")
 
     def _open_settings(self):
+        old_pb = self._project.detection.padding_before
+        old_pa = self._project.detection.padding_after
         dlg = SettingsDialog(self._project.detection, self._dark, self)
         if dlg.exec() == SettingsDialog.Accepted:
+            new_pb = self._project.detection.padding_before
+            new_pa = self._project.detection.padding_after
+            if new_pb != old_pb or new_pa != old_pa:
+                self._project.recompute_padding(new_pb, new_pa)
+                self._show_results()
             self.statusBar().showMessage("设置已保存", 3000)
 
     # ---- OCR 识别 ----
@@ -489,6 +496,8 @@ class MainWindow(QMainWindow):
         for r in time_ranges:
             all_clips.append(ClipResult(
                 start_sec=r.start_sec, end_sec=r.end_sec,
+                raw_start_sec=getattr(r, 'raw_start_sec', r.start_sec),
+                raw_end_sec=getattr(r, 'raw_end_sec', r.end_sec),
                 action=r.action, actor=r.actor,
                 pattern_id=r.pattern_id, source=r.source))
 
@@ -585,11 +594,13 @@ class MainWindow(QMainWindow):
         for c in clips:
             r = DetectionResult(
                 start_sec=c.start_sec, end_sec=c.end_sec,
+                raw_start_sec=c.raw_start_sec, raw_end_sec=c.raw_end_sec,
                 action=c.action, actor=c.actor,
                 pattern_id=c.pattern_id, source=c.source)
             rr = refiner.refine(r, fps, search_window=search_window)
             refined.append(ClipResult(
                 start_sec=rr.start_sec, end_sec=rr.end_sec,
+                raw_start_sec=rr.raw_start_sec, raw_end_sec=rr.raw_end_sec,
                 action=rr.action, actor=rr.actor,
                 pattern_id=rr.pattern_id, source=rr.source))
         return refined
@@ -641,6 +652,7 @@ class MainWindow(QMainWindow):
                 for se in sub_events:
                     all_results.append(ClipResult(
                         start_sec=se.start_sec, end_sec=se.end_sec,
+                        raw_start_sec=se.raw_start_sec, raw_end_sec=se.raw_end_sec,
                         action=se.action, actor=se.actor,
                         pattern_id=se.pattern_id, source=se.source))
             else:
@@ -675,8 +687,11 @@ class MainWindow(QMainWindow):
                     actor = item[3] if len(item) > 3 else ""
                     pid = item[4] if len(item) > 4 else ""
                     src = item[5] if len(item) > 5 else "text"
+                    rss = item[6] if len(item) > 6 else 0.0
+                    rse = item[7] if len(item) > 7 else 0.0
                     all_clips.append(ClipResult(
-                        start_sec=s, end_sec=e, action=action, actor=actor,
+                        start_sec=s, end_sec=e, raw_start_sec=rss, raw_end_sec=rse,
+                        action=action, actor=actor,
                         pattern_id=pid, source=src))
             self._log.debug("构建 %d 个 ClipResult", len(all_clips))
             if self._project.detection.refine_boundaries and all_clips:

@@ -80,6 +80,8 @@ class ClipResult:
     """单个识别结果片段（TimeRange + 事件元数据）"""
     start_sec: float
     end_sec: float
+    raw_start_sec: float = 0.0
+    raw_end_sec: float = 0.0
     pattern_id: str = ""
     action: str = ""
     actor: str = ""
@@ -230,6 +232,8 @@ class Project:
                     for r in data.get("results", []):
                         self.results.append(ClipResult(
                             start_sec=r["start_sec"], end_sec=r["end_sec"],
+                            raw_start_sec=r.get("raw_start_sec", r["start_sec"]),
+                            raw_end_sec=r.get("raw_end_sec", r["end_sec"]),
                             pattern_id=r.get("pattern_id", ""),
                             action=r.get("action", ""), actor=r.get("actor", ""),
                             raw_text=r.get("raw_text", ""),
@@ -271,6 +275,16 @@ class Project:
             self.annotations.save_json(path)
 
     # ---- 片段结果（带 undo/redo） ----
+
+    def recompute_padding(self, padding_before: float, padding_after: float):
+        """用新的 padding 重新计算所有结果的 start_sec / end_sec"""
+        for r in self.results:
+            if r.raw_start_sec > 0 or r.raw_end_sec > 0:
+                r.start_sec = max(0.0, r.raw_start_sec - padding_before)
+                r.end_sec = r.raw_end_sec + padding_after
+        self.detection.padding_before = padding_before
+        self.detection.padding_after = padding_after
+        self._dirty = True
 
     def set_results(self, items: list[ClipResult]):
         old = list(self.results)
@@ -369,6 +383,8 @@ class Project:
                 {
                     "start_sec": r.start_sec,
                     "end_sec": r.end_sec,
+                    "raw_start_sec": r.raw_start_sec,
+                    "raw_end_sec": r.raw_end_sec,
                     "pattern_id": r.pattern_id,
                     "action": r.action,
                     "actor": r.actor,
@@ -417,6 +433,8 @@ class Project:
         for r in data.get("results", []):
             proj.results.append(ClipResult(
                 start_sec=r["start_sec"], end_sec=r["end_sec"],
+                raw_start_sec=r.get("raw_start_sec", r["start_sec"]),
+                raw_end_sec=r.get("raw_end_sec", r["end_sec"]),
                 pattern_id=r.get("pattern_id", ""),
                 action=r.get("action", ""), actor=r.get("actor", ""),
                 raw_text=r.get("raw_text", ""),

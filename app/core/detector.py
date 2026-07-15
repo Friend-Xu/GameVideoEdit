@@ -56,6 +56,8 @@ class DetectionResult(TimeRange):
     pattern_id: str = ""
     match_count: int = 1
     source: str = "text"  # "text", "counter", "both"
+    raw_start_sec: float = 0.0
+    raw_end_sec: float = 0.0
 
 
 @dataclass
@@ -415,6 +417,8 @@ class EventStackEngine:
         self._results.append(DetectionResult(
             start_sec=max(0.0, events[0].timestamp - self._cfg.padding_before),
             end_sec=events[-1].timestamp + self._cfg.padding_after,
+            raw_start_sec=events[0].timestamp,
+            raw_end_sec=events[-1].timestamp,
             action=key[0], actor=key[1], pattern_id=events[0].pattern_id,
             match_count=len(events), source=src,
         ))
@@ -1254,6 +1258,8 @@ class DetectionEngine:
                 merged[-1] = DetectionResult(
                     start_sec=last.start_sec,
                     end_sec=max(last.end_sec, r.end_sec),
+                    raw_start_sec=min(last.raw_start_sec, r.raw_start_sec),
+                    raw_end_sec=max(last.raw_end_sec, r.raw_end_sec),
                     action=last.action,
                     actor=last.actor,
                     pattern_id=last.pattern_id,
@@ -1704,6 +1710,8 @@ class DetectionPipeline:
                 _log.info("细胞分裂(gap): 完成 (%d 个精确事件)", len(precise))
                 # 添加 padding
                 for r in precise:
+                    r.raw_start_sec = r.start_sec
+                    r.raw_end_sec = r.end_sec
                     r.start_sec = max(0.0, r.start_sec - self.padding_before)
                     r.end_sec = r.end_sec + self.padding_after
                 # 合并重叠或相近的事件
