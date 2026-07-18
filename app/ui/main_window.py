@@ -292,10 +292,18 @@ class MainWindow(QMainWindow):
         det.gate_mode = d.get("gate_mode", "neural")
         det.ocr_engine = d.get("ocr_engine", "rapidocr")
 
+    def _on_preset_changed(self, config: dict):
+        """预设改变后重建 matcher 并刷新结果。"""
+        from app.core.keywords import KeywordMatcher
+        self._matcher = KeywordMatcher.from_dict(config)
+        self._log.info("规则预设已更新 (%d 条规则)", len(config.get("rules", [])))
+
     def _open_settings(self):
         old_pb = self._project.detection.padding_before
         old_pa = self._project.detection.padding_after
-        dlg = SettingsDialog(self._project.detection, self._dark, self)
+        dlg = SettingsDialog(self._project.detection, self._dark, self,
+                             matcher=self._matcher,
+                             preset_callback=self._on_preset_changed)
         if dlg.exec() == SettingsDialog.Accepted:
             new_pb = self._project.detection.padding_before
             new_pa = self._project.detection.padding_after

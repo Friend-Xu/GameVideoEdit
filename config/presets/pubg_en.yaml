@@ -1,0 +1,72 @@
+# PUBG Mobile — English killfeed detection preset
+meta:
+  name: "PUBG Mobile English"
+  game: "PUBG Mobile"
+  language: "en"
+  version: "1.0.0"
+
+descriptors:
+  - "headshot"
+  - "head shot"
+
+trigger_prefixes:
+  - "You"
+  - "Your teammate"
+  - "You were"
+
+rules:
+  - id: kill_self
+    actor: "自己"
+    actor_signal: "You"
+    action: "killed"
+    match_strategy: exact
+
+  - id: knockdown_self
+    actor: "自己"
+    actor_signal: "You"
+    action: "knocked out"
+    match_strategy: exact
+
+  - id: teammate_killed
+    actor: "敌人"
+    actor_signal: "Your teammate"
+    require_signal: "was"
+    action: "killed"
+    match_strategy: fuzzy
+    similarity_threshold: 0.85
+
+  - id: teammate_knocked
+    actor: "敌人"
+    actor_signal: "Your teammate"
+    require_signal: "was"
+    action: "knocked out"
+    match_strategy: fuzzy
+    similarity_threshold: 0.85
+
+  - id: killed_self
+    actor: "敌人"
+    actor_signal: "You were"
+    action: "killed"
+    match_strategy: fuzzy
+    similarity_threshold: 0.85
+
+  - id: knocked_self
+    actor: "敌人"
+    actor_signal: "You were"
+    action: "knocked out"
+    match_strategy: fuzzy
+    similarity_threshold: 0.85
+
+  - id: kill_teammate
+    actor: "队友"
+    actor_signal: "Your teammate"
+    anti_signal: "was"
+    action: "killed"
+    match_strategy: exact
+
+  - id: knockdown_teammate
+    actor: "队友"
+    actor_signal: "Your teammate"
+    anti_signal: "was"
+    action: "knocked out"
+    match_strategy: exact

@@ -1,30 +1,39 @@
 """设置对话框 —— 左侧导航 + 右侧内容区。"""
 
+import logging
 import yaml
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QListWidget, QPushButton,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
     QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from app.core.project import DetectionConfig
 from app.utils.paths import config_dir
 
+_log = logging.getLogger("app.ui.settings_dialog")
+
 
 class SettingsDialog(QDialog):
     """识别参数设置对话框"""
 
+    preset_changed = Signal(str)
+
     def __init__(self, detection: DetectionConfig, dark: bool = False,
-                 parent=None):
+                 parent=None, matcher=None, preset_callback=None):
         super().__init__(parent)
         self._detection = detection
         self._dark = dark
+        self._matcher = matcher
+        self._preset_callback = preset_callback
+        self._rules_modified = False
         self._initial = self._snapshot()
         self.setWindowTitle("设置")
-        self.setMinimumSize(600, 400)
-        self.resize(620, 420)
+        self.setMinimumSize(640, 460)
+        self.resize(680, 520)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._setup_ui()
         self._apply_theme()
@@ -64,7 +73,7 @@ class SettingsDialog(QDialog):
         self._nav = QListWidget()
         self._nav.setFixedWidth(140)
         self._nav.setObjectName("settingsNav")
-        self._nav.addItems(["识别", "性能", "时间"])
+        self._nav.addItems(["识别", "性能", "时间", "规则"])
         self._nav.setCurrentRow(0)
         root.addWidget(self._nav)
 
@@ -80,6 +89,7 @@ class SettingsDialog(QDialog):
             "性能设置", self._build_performance_form()))
         self._stack.addWidget(self._build_page(
             "时间参数", self._build_timing_form()))
+        self._stack.addWidget(self._build_rules_page())
         self._nav.currentRowChanged.connect(self._stack.setCurrentIndex)
         right.addWidget(self._stack, 1)
 
@@ -122,6 +132,220 @@ class SettingsDialog(QDialog):
         ly.addLayout(form)
         ly.addStretch()
         return page
+
+    # ---- 规则页面 ----
+
+    def _build_rules_page(self) -> QWidget:
+        page = QWidget()
+        ly = QVBoxLayout(page)
+        ly.setContentsMargins(0, 0, 0, 0)
+        ly.setSpacing(0)
+
+        header = QLabel("规则配置")
+        header.setObjectName("settingsSectionTitle")
+        ly.addWidget(header)
+        ly.addSpacing(12)
+
+        # 预设选择行
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(8)
+        self._preset_combo = QComboBox()
+        self._preset_combo.setMinimumWidth(200)
+        self._preset_combo.currentTextChanged.connect(self._on_preset_selected)
+        preset_row.addWidget(QLabel("预设:"))
+        preset_row.addWidget(self._preset_combo, 1)
+        btn_import = QPushButton("导入")
+        btn_import.clicked.connect(self._import_preset)
+        preset_row.addWidget(btn_import)
+        btn_export = QPushButton("导出")
+        btn_export.clicked.connect(self._export_preset)
+        preset_row.addWidget(btn_export)
+        ly.addLayout(preset_row)
+        ly.addSpacing(12)
+
+        # 规则列表（可滚动）
+        self._rule_list = QListWidget()
+        self._rule_list.setMaximumHeight(160)
+        self._rule_list.currentRowChanged.connect(self._on_rule_selected)
+        ly.addWidget(QLabel("规则列表（勾选 = 启用）:"))
+        ly.addWidget(self._rule_list)
+        ly.addSpacing(8)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("+ 添加规则")
+        btn_add.clicked.connect(self._add_rule)
+        btn_row.addWidget(btn_add)
+        btn_del = QPushButton("删除选中")
+        btn_del.clicked.connect(self._delete_rule)
+        btn_row.addWidget(btn_del)
+        btn_row.addStretch()
+        ly.addLayout(btn_row)
+        ly.addSpacing(12)
+
+        # 规则编辑器
+        ly.addWidget(QLabel("编辑选中规则:"))
+        self._rule_form = QFormLayout()
+        self._rule_form.setSpacing(8)
+        self._rule_form.setContentsMargins(0, 8, 0, 0)
+
+        self._edit_signal = QLineEdit()
+        self._edit_signal.setPlaceholderText("如: 你的队友")
+        self._edit_action = QComboBox()
+        self._edit_action.addItems(["淘汰", "击倒", "killed", "knocked out"])
+        self._edit_action.setEditable(True)
+        self._edit_actor = QComboBox()
+        self._edit_actor.addItems(["自己", "敌人", "队友"])
+        self._edit_actor.setEditable(True)
+        self._edit_strategy = QComboBox()
+        self._edit_strategy.addItems(["精确匹配", "模糊匹配"])
+        self._edit_threshold = QDoubleSpinBox()
+        self._edit_threshold.setRange(0.5, 1.0)
+        self._edit_threshold.setSingleStep(0.05)
+        self._edit_threshold.setDecimals(2)
+
+        self._rule_form.addRow("触发词", self._edit_signal)
+        self._rule_form.addRow("动作", self._edit_action)
+        self._rule_form.addRow("归属", self._edit_actor)
+        self._rule_form.addRow("匹配策略", self._edit_strategy)
+        self._rule_form.addRow("模糊阈值", self._edit_threshold)
+        ly.addLayout(self._rule_form)
+
+        btn_save_rule = QPushButton("保存规则")
+        btn_save_rule.clicked.connect(self._save_rule)
+        ly.addWidget(btn_save_rule)
+        ly.addStretch()
+
+        self._refresh_presets()
+        return page
+
+    def _refresh_presets(self):
+        from app.core.presets import PresetManager
+        pm = PresetManager()
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.clear()
+        presets = pm.list()
+        for p in presets:
+            self._preset_combo.addItem(
+                f"{p['name']} ({p['game']}, {p['language']})", p["file"])
+        # Also show current custom config
+        self._preset_combo.insertItem(0, "（当前配置）", None)
+        self._preset_combo.setCurrentIndex(0)
+        self._preset_combo.blockSignals(False)
+        self._refresh_rule_list()
+
+    def _refresh_rule_list(self):
+        self._rule_list.clear()
+        if not self._matcher or not self._matcher._rules_config:
+            return
+        for rule in self._matcher._rules_config:
+            sid = rule.get("actor_signal", "?")
+            act = rule.get("action", "?")
+            strat = rule.get("match_strategy", "exact")
+            thresh = rule.get("similarity_threshold", 0.85)
+            label = f"{sid} → {act}"
+            if strat == "fuzzy":
+                label += f"  [模糊 {thresh:.0%}]"
+            else:
+                label += "  [精确]"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, rule.get("id"))
+            item.setCheckState(Qt.Checked if rule.get("enabled", True) else Qt.Unchecked)
+            self._rule_list.addItem(item)
+
+    def _on_preset_selected(self, name: str):
+        idx = self._preset_combo.currentIndex()
+        file_name = self._preset_combo.itemData(idx)
+        if not file_name:
+            self._rule_list.clear()
+            return
+        from app.core.presets import PresetManager
+        from app.core.keywords import KeywordMatcher
+        pm = PresetManager()
+        config = pm.load(file_name.replace(".yaml", ""))
+        self._matcher = KeywordMatcher.from_dict(config)
+        self._refresh_rule_list()
+
+    def _on_rule_selected(self, row: int):
+        if row < 0 or not self._matcher or row >= len(self._matcher._rules_config):
+            return
+        rule = self._matcher._rules_config[row]
+        self._edit_signal.setText(rule.get("actor_signal", ""))
+        self._edit_action.setCurrentText(rule.get("action", ""))
+        self._edit_actor.setCurrentText(rule.get("actor", ""))
+        strat = rule.get("match_strategy", "exact")
+        self._edit_strategy.setCurrentIndex(0 if strat == "exact" else 1)
+        self._edit_threshold.setValue(rule.get("similarity_threshold", 0.85))
+
+    def _save_rule(self):
+        row = self._rule_list.currentRow()
+        if row < 0 or not self._matcher or row >= len(self._matcher._rules_config):
+            return
+        rule = self._matcher._rules_config[row]
+        rule["actor_signal"] = self._edit_signal.text()
+        rule["action"] = self._edit_action.currentText()
+        rule["actor"] = self._edit_actor.currentText()
+        rule["match_strategy"] = "exact" if self._edit_strategy.currentIndex() == 0 else "fuzzy"
+        rule["similarity_threshold"] = self._edit_threshold.value()
+        self._rules_modified = True
+        self._refresh_rule_list()
+        self._rule_list.setCurrentRow(row)
+
+    def _add_rule(self):
+        new_rule = {
+            "id": f"rule_{len(self._matcher._rules_config) + 1}",
+            "actor": "敌人", "actor_signal": "", "action": "淘汰",
+            "match_strategy": "exact", "similarity_threshold": 0.85,
+        }
+        if not self._matcher:
+            from app.core.keywords import KeywordMatcher
+            self._matcher = KeywordMatcher.from_dict({"rules": []})
+        self._matcher._rules_config.append(new_rule)
+        self._rules_modified = True
+        self._refresh_rule_list()
+        self._rule_list.setCurrentRow(len(self._matcher._rules_config) - 1)
+
+    def _delete_rule(self):
+        row = self._rule_list.currentRow()
+        if row < 0 or not self._matcher or row >= len(self._matcher._rules_config):
+            return
+        del self._matcher._rules_config[row]
+        self._rules_modified = True
+        self._refresh_rule_list()
+
+    def _import_preset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入规则预设", "", "JSON 文件 (*.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            from app.core.presets import PresetManager
+            from app.core.keywords import KeywordMatcher
+            pm = PresetManager()
+            name = pm.import_json(path)
+            config = pm.load(name)
+            self._matcher = KeywordMatcher.from_dict(config)
+            self._rules_modified = True
+            self._refresh_presets()
+            self._preset_combo.setCurrentText(name)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+
+    def _export_preset(self):
+        idx = self._preset_combo.currentIndex()
+        file_name = self._preset_combo.itemData(idx)
+        if not file_name:
+            QMessageBox.warning(self, "导出失败", "请先选择一个预设")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出规则预设", file_name, "JSON 文件 (*.json)")
+        if not path:
+            return
+        try:
+            from app.core.presets import PresetManager
+            pm = PresetManager()
+            pm.export_json(file_name.replace(".yaml", ""), path)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
 
     # ---- 识别页面 ----
 
@@ -392,7 +616,20 @@ class SettingsDialog(QDialog):
 
     def _save_and_accept(self):
         self._write_defaults()
+        if self._rules_modified and self._matcher:
+            self._save_rules_to_yaml()
         self.accept()
+
+    def _save_rules_to_yaml(self):
+        """保存当前规则到 keywords.yaml 并通知主窗口重建 matcher。"""
+        if not self._matcher:
+            return
+        from app.core.presets import PresetManager
+        pm = PresetManager()
+        config = self._matcher.to_dict()
+        pm.save("current_rules", config)
+        if self._preset_callback:
+            self._preset_callback(self._matcher.to_dict())
 
     def _reset_defaults(self):
         path = config_dir() / "default.yaml"
