@@ -1,0 +1,93 @@
+# PUBG Mobile — 한국어 킬피드 감지 프리셋
+# ⚠️ 주의: 실제 게임 내 킬 메시지 텍스트가 웹에서 확인되지 않았습니다.
+# 아래 시그널 단어는 PUBG PC 한글판 킬피드 및 일반적인 한국어 게임 용어를 바탕으로 추정한 것입니다.
+# 게임 언어를 한국어로 전환 후 실제 킬피드 텍스트를 확인하여 수정이 필요할 수 있습니다.
+#
+# 예상 킬피드 형식:
+#   - 당신이 [무기](으)로 [플레이어]를 처치했습니다
+#   - 당신이 [무기](으)로 [플레이어]를 기절시켰습니다
+#   - 당신의 팀원 [이름]이(가) [무기](으)로 [플레이어]를 처치했습니다
+#   - [적]이(가) [무기](으)로 당신을 처치했습니다
+#
+# 검증 필요: 게임 내 실제 텍스트 확인 후 match_strategy 를 exact 로 변경 가능
+
+meta:
+  platform: "mobile"
+  name: "PUBG Mobile 한국어"
+  game: "PUBG Mobile"
+  language: "ko"
+  version: "1.0.0-beta"
+
+descriptors:
+  - "헤드샷"
+
+trigger_prefixes:
+  - "당신"
+  - "팀원"
+
+rules:
+  # === 자신 처치 ===
+  - id: kill_self
+    actor: "자신"
+    actor_signal: "당신이"
+    anti_signal: "팀원"
+    action: "처치"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  - id: knockdown_self
+    actor: "자신"
+    actor_signal: "당신이"
+    anti_signal: "팀원"
+    action: "기절"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  # === 팀원이 적에게 당함 ===
+  - id: teammate_killed
+    actor: "적"
+    actor_signal: "팀원"
+    require_signal: "당했"
+    action: "처치"
+    match_strategy: fuzzy
+    similarity_threshold: 0.70
+
+  - id: teammate_knocked
+    actor: "적"
+    actor_signal: "팀원"
+    require_signal: "당했"
+    action: "기절"
+    match_strategy: fuzzy
+    similarity_threshold: 0.70
+
+  # === 자신이 적에게 당함 ===
+  - id: killed_self
+    actor: "적"
+    actor_signal: "당신을"
+    action: "처치"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  - id: knocked_self
+    actor: "적"
+    actor_signal: "당신을"
+    action: "기절"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  # === 팀원이 적 처치 ===
+  - id: kill_teammate
+    actor: "팀원"
+    actor_signal: "팀원"
+    anti_signal: "당했"
+    action: "처치"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  - id: knockdown_teammate
+    actor: "팀원"
+    actor_signal: "팀원"
+    anti_signal: "당했"
+    action: "기절"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75

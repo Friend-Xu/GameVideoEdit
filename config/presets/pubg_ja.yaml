@@ -1,0 +1,93 @@
+# PUBG Mobile — 日本語キルフィード検出プリセット
+# ⚠️ 注意: 実際のゲーム内キルメッセージテキストはウェブ上で確認できませんでした。
+# 以下のシグナルワードは一般的な日本語ゲーム用語とPUBG PC日本語版のキルフィードから推定したものです。
+# ゲーム言語を日本語に切り替えた後、実際のキルフィードテキストを確認し修正が必要な場合があります。
+#
+# 想定キルフィード形式:
+#   - あなたは [武器] で [プレイヤー] を倒した
+#   - あなたは [武器] で [プレイヤー] をノックアウトした
+#   - チームメイト [名前] は [武器] で [プレイヤー] を倒した
+#   - [敵] は [武器] であなたを倒した
+#
+# 要検証: ゲーム内の実際のテキスト確認後、match_strategy を exact に変更可能
+
+meta:
+  platform: "mobile"
+  name: "PUBG Mobile 日本語"
+  game: "PUBG Mobile"
+  language: "ja"
+  version: "1.0.0-beta"
+
+descriptors:
+  - "ヘッドショット"
+
+trigger_prefixes:
+  - "あなた"
+  - "チームメイト"
+
+rules:
+  # === 自分キル ===
+  - id: kill_self
+    actor: "自分"
+    actor_signal: "あなたは"
+    anti_signal: "に"
+    action: "倒した"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  - id: knockdown_self
+    actor: "自分"
+    actor_signal: "あなたは"
+    anti_signal: "に"
+    action: "ノックアウト"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  # === チームメイトが敵にやられた ===
+  - id: teammate_killed
+    actor: "敵"
+    actor_signal: "チームメイト"
+    require_signal: "れた"
+    action: "倒した"
+    match_strategy: fuzzy
+    similarity_threshold: 0.70
+
+  - id: teammate_knocked
+    actor: "敵"
+    actor_signal: "チームメイト"
+    require_signal: "れた"
+    action: "ノックアウト"
+    match_strategy: fuzzy
+    similarity_threshold: 0.70
+
+  # === 自分が敵にやられた ===
+  - id: killed_self
+    actor: "敵"
+    actor_signal: "あなたを"
+    action: "倒した"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  - id: knocked_self
+    actor: "敵"
+    actor_signal: "あなたを"
+    action: "ノックアウト"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  # === チームメイトがキル ===
+  - id: kill_teammate
+    actor: "チームメイト"
+    actor_signal: "チームメイト"
+    anti_signal: "れた"
+    action: "倒した"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75
+
+  - id: knockdown_teammate
+    actor: "チームメイト"
+    actor_signal: "チームメイト"
+    anti_signal: "れた"
+    action: "ノックアウト"
+    match_strategy: fuzzy
+    similarity_threshold: 0.75

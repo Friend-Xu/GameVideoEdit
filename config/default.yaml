@@ -12,12 +12,12 @@ ocr:
 detection:
   mode: time
   interval_sec: 1.0
-  skip_frames: 3
+  skip_frames: 15
   post_detect_skip_sec: 0.3
-  padding_before: 5
-  padding_after: 5
+  padding_before: 5.0
+  padding_after: 5.0
   merge_gap: 30.0
-  num_threads: 1
+  num_threads: 4
   rotation: 0
   pipeline_mode: pool
   cpu_workers: 6

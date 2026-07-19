@@ -58,7 +58,32 @@ class MainWindow(QMainWindow):
         btn_open = QPushButton("打开视频"); btn_open.setProperty("cssClass", "primary")
         btn_open.clicked.connect(self._open_video); tl.addWidget(btn_open)
         title = QLabel("药药的剪辑工具"); title.setObjectName("titleLabel")
-        tl.addWidget(title); tl.addStretch()
+        tl.addWidget(title)
+        # 平台切换 (手机/PC)
+        self._platform_mobile_btn = QPushButton("手机")
+        self._platform_mobile_btn.setCheckable(True); self._platform_mobile_btn.setChecked(True)
+        self._platform_mobile_btn.setStyleSheet(
+            "QPushButton { padding: 4px 12px; border: 1px solid #9C27B0; "
+            "border-radius: 4px 0 0 4px; color: white; background: #9C27B0; font-weight: bold; }"
+            "QPushButton:checked { background: #9C27B0; }"
+            "QPushButton:!checked { background: transparent; color: #aaa; }")
+        self._platform_mobile_btn.clicked.connect(lambda: self._on_platform_changed("mobile"))
+        tl.addWidget(self._platform_mobile_btn)
+        self._platform_pc_btn = QPushButton("PC")
+        self._platform_pc_btn.setCheckable(True)
+        self._platform_pc_btn.setStyleSheet(
+            "QPushButton { padding: 4px 12px; border: 1px solid #9C27B0; "
+            "border-radius: 0 4px 4px 0; color: #aaa; background: transparent; font-weight: bold; }"
+            "QPushButton:checked { background: #9C27B0; color: white; }"
+            "QPushButton:!checked { background: transparent; color: #aaa; }")
+        self._platform_pc_btn.clicked.connect(lambda: self._on_platform_changed("pc"))
+        tl.addWidget(self._platform_pc_btn)
+        tl.addWidget(QLabel("  语言与正则预设"))
+        self._toolbar_preset_combo = QComboBox()
+        self._toolbar_preset_combo.setMinimumWidth(180)
+        self._toolbar_preset_combo.currentIndexChanged.connect(self._on_toolbar_preset_changed)
+        tl.addWidget(self._toolbar_preset_combo)
+        tl.addStretch()
         self._settings_btn = QPushButton("⚙ 设置")
         self._settings_btn.clicked.connect(self._open_settings)
         tl.addWidget(self._settings_btn)
@@ -208,6 +233,7 @@ class MainWindow(QMainWindow):
 
         vp.set_label_colors(sp.label_colors())
         vp.set_current_label(sp.current_label)
+        sp.label_changed.connect(vp.set_current_label)
 
     def _on_template_applied(self, name: str):
         from app.core.roi_templates import ROITemplateManager
@@ -292,18 +318,101 @@ class MainWindow(QMainWindow):
         det.gate_mode = d.get("gate_mode", "neural")
         det.ocr_engine = d.get("ocr_engine", "rapidocr")
 
-    def _on_preset_changed(self, config: dict):
+    def _on_platform_changed(self, platform: str):
+        """平台切换：Project 自动隔离状态，这里只刷新 UI。"""
+        if self._project.platform == platform:
+            return
+        self._project.platform = platform
+        self._platform_mobile_btn.setChecked(platform == "mobile")
+        self._platform_pc_btn.setChecked(platform == "pc")
+        # 刷新预设下拉框 + 加载当前平台的 matcher
+        self._refresh_toolbar_presets(platform)
+        self._load_matcher_for_platform(platform)
+        self._sync_toolbar_preset_to_file(self._project.preset_file)
+        # 刷新 ROI 标注（加载新平台默认模板）
+        self._project._auto_load_roi(platform)
+        self._player.refresh_regions()
+        # 刷新侧边栏（标签 + 模板列表）
+        self._side_panel.on_platform_changed(platform)
+        # 清空旧平台的识别结果展示
+        self._result_list.clear()
+        self._filter_bar.setVisible(False)
+        self._result_label.setText("识别结果")
+        self.statusBar().showMessage(
+            f"已切换到{'PC' if platform == 'pc' else '手机'}模式", 3000)
+
+    def _on_preset_changed(self, config: dict, preset_file: str = ""):
         """预设改变后重建 matcher 并刷新结果。"""
         from app.core.keywords import KeywordMatcher
         self._matcher = KeywordMatcher.from_dict(config)
+        if preset_file:
+            self._project.preset_file = preset_file
+            settings = QSettings("GameVideoEdit", "PeaceEliteHighlights")
+            settings.setValue(f"preset/{self._project.platform}", preset_file)
+        else:
+            self._project.preset_file = ""
+        self._sync_toolbar_preset_to_file(preset_file)
         self._log.info("规则预设已更新 (%d 条规则)", len(config.get("rules", [])))
+
+    def _refresh_toolbar_presets(self, platform: str):
+        """按平台填充工具栏预设下拉框。"""
+        from app.core.presets import PresetManager
+        pm = PresetManager()
+        presets = pm.list(platform)
+        self._toolbar_preset_combo.blockSignals(True)
+        self._toolbar_preset_combo.clear()
+        self._toolbar_preset_combo.addItem("（当前配置）", None)
+        for p in presets:
+            display = f"{p['name']} ({p['language']})"
+            self._toolbar_preset_combo.addItem(display, p["file"])
+        self._toolbar_preset_combo.blockSignals(False)
+
+    def _sync_toolbar_preset_to_file(self, preset_file: str):
+        """同步工具栏下拉框选中项到指定预设文件名。"""
+        self._toolbar_preset_combo.blockSignals(True)
+        if not preset_file:
+            self._toolbar_preset_combo.setCurrentIndex(0)
+        else:
+            for i in range(self._toolbar_preset_combo.count()):
+                if self._toolbar_preset_combo.itemData(i) == preset_file:
+                    self._toolbar_preset_combo.setCurrentIndex(i)
+                    break
+            else:
+                self._toolbar_preset_combo.setCurrentIndex(0)
+        self._toolbar_preset_combo.blockSignals(False)
+
+    def _on_toolbar_preset_changed(self, index: int):
+        """工具栏预设下拉框选择即加载。"""
+        if index < 0:
+            return
+        file_name = self._toolbar_preset_combo.itemData(index)
+        platform = self._project.platform
+        settings = QSettings("GameVideoEdit", "PeaceEliteHighlights")
+        if not file_name:
+            settings.setValue(f"preset/{platform}", "")
+            return
+        from app.core.presets import PresetManager
+        from app.core.keywords import KeywordMatcher
+        try:
+            pm = PresetManager()
+            config = pm.load(file_name.replace(".yaml", ""))
+            self._matcher = KeywordMatcher.from_dict(config)
+            self._project.preset_file = file_name
+            settings.setValue(f"preset/{platform}", file_name)
+            self._log.info("已加载预设: %s", file_name)
+        except FileNotFoundError:
+            self._log.warning("预设文件不存在: %s", file_name)
+            settings.setValue(f"preset/{platform}", "")
+            self._sync_toolbar_preset_to_file("")
 
     def _open_settings(self):
         old_pb = self._project.detection.padding_before
         old_pa = self._project.detection.padding_after
         dlg = SettingsDialog(self._project.detection, self._dark, self,
                              matcher=self._matcher,
-                             preset_callback=self._on_preset_changed)
+                             preset_callback=self._on_preset_changed,
+                             platform=self._project.platform,
+                             active_preset=self._project.preset_file)
         if dlg.exec() == SettingsDialog.Accepted:
             new_pb = self._project.detection.padding_before
             new_pa = self._project.detection.padding_after
@@ -313,6 +422,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("设置已保存", 3000)
 
     # ---- OCR 识别 ----
+
+    def _validate_roi_for_platform(self, ann) -> bool:
+        """校验当前平台的 ROI 标签是否齐全。"""
+        labels = {r.label for r in ann.regions}
+        if self._project.platform == "pc":
+            required = {"个人击杀", "队友击杀"}
+            missing = required - labels
+            if missing:
+                QMessageBox.warning(self, "ROI 不完整",
+                    f"PC 模式需要以下 ROI:\n{', '.join(required)}\n\n"
+                    f"缺少: {', '.join(missing)}\n\n请切换到手机模式或框选全部 ROI 区域。")
+                return False
+        else:
+            if "击杀信息" not in labels:
+                QMessageBox.warning(self, "ROI 不完整",
+                    "手机模式需要 \"击杀信息\" ROI。\n\n请框选击杀信息区域或切换到 PC 模式。")
+                return False
+        return True
 
     # ---- OCR 识别 ----
 
@@ -334,6 +461,9 @@ class MainWindow(QMainWindow):
         if ann.region_count == 0:
             QMessageBox.warning(self, "缺少 ROI", "请先在侧边栏设置 ROI 检测区域（击杀信息等）")
             self._log.warning("_start_detection 退出: 无 ROI")
+            return
+        # 平台校验: PC 需要 "个人击杀" + "队友击杀", Mobile 需要 "击杀信息"
+        if not self._validate_roi_for_platform(ann):
             return
         self._project.auto_save_roi()
         self._log.info("检测开始: %d 个 ROI 区域", ann.region_count)
@@ -968,8 +1098,68 @@ class MainWindow(QMainWindow):
             self._update_export_buttons()
 
     def _load_matcher(self):
+        platform = self._project.platform
+        self._refresh_toolbar_presets(platform)
+        self._load_matcher_for_platform(platform)
+        self._sync_toolbar_preset_to_file(self._project.preset_file)
+
+    def _load_matcher_for_platform(self, platform: str):
+        """加载指定平台的 matcher。
+
+        优先级: QSettings 全局偏好 > 项目预设 > 平台默认 > keywords.yaml
+        """
+        from app.core.presets import PresetManager
+        from app.utils.paths import config_dir
+
+        settings = QSettings("GameVideoEdit", "PeaceEliteHighlights")
+        saved_preset = settings.value(f"preset/{platform}", "")
+
+        # ── 1. QSettings 全局偏好 ──
+        if saved_preset:
+            try:
+                pm = PresetManager()
+                cfg = pm.load(saved_preset.replace(".yaml", ""))
+                self._matcher = KeywordMatcher.from_dict(cfg)
+                self._project.preset_file = saved_preset
+                return
+            except FileNotFoundError:
+                self._log.debug("全局预设已删除: %s", saved_preset)
+                settings.setValue(f"preset/{platform}", "")
+
+        # ── 2. 项目级预设文件 ──
+        pf = self._project.preset_file
+        if pf:
+            try:
+                pm = PresetManager()
+                cfg = pm.load(pf.replace(".yaml", ""))
+                self._matcher = KeywordMatcher.from_dict(cfg)
+                return
+            except Exception:
+                pass
+
+        # ── 3. 平台第一个预设 (PC 优先简体中文) ──
         try:
-            from app.utils.paths import config_dir
+            pm = PresetManager()
+            presets = pm.list(platform)
+            if presets:
+                if platform == "pc":
+                    for p in presets:
+                        if p["file"] == "pubg_pc_zh.yaml":
+                            cfg = pm.load("pubg_pc_zh")
+                            self._matcher = KeywordMatcher.from_dict(cfg)
+                            self._project.preset_file = "pubg_pc_zh.yaml"
+                            return
+                cfg = pm.load(presets[0]["file"].replace(".yaml", ""))
+                self._matcher = KeywordMatcher.from_dict(cfg)
+                self._project.preset_file = presets[0]["file"]
+                return
+        except Exception:
+            pass
+
+        # ── 4. keywords.yaml 回退 ──
+        try:
             kw = config_dir() / "keywords.yaml"
-            if kw.exists(): self._matcher = KeywordMatcher.from_yaml(str(kw))
-        except Exception: pass
+            if kw.exists():
+                self._matcher = KeywordMatcher.from_yaml(str(kw))
+        except Exception:
+            pass

@@ -1,94 +1,104 @@
-# 和平精英击杀检测关键词配置（信号拆解格式）
-platform: "mobile"
+# PUBG Mobile / 絕地求生 — 繁體中文擊殺檢測預設
+meta:
+  platform: "mobile"
+  name: "PUBG Mobile 繁體中文"
+  game: "PUBG Mobile"
+  language: "zh_TW"
+  version: "1.0.0"
 
-
-# 全局描述词 — 游戏更新改这里即可
 descriptors:
-  - "精确打击"   # 新版本
-  - "爆头"       # 旧版本
-  - "命中头部"   # 旧版本变体
+  - "精確打擊"
+  - "爆頭"
+  - "命中頭部"
 
-# 触发前缀(OCR文本必须包含以下任一项才进入匹配)
 trigger_prefixes:
   - "你使用"
-  - "你的队友"
+  - "你的隊友"
   - "你被"
   - "你引爆"
 
 rules:
-  # === 自己击杀 ===
+  # === 自己擊殺 ===
   - id: kill_self
     actor: "自己"
     actor_signal: "你使用"
     action: "淘汰"
+    match_strategy: exact
 
   - id: knockdown_self
     actor: "自己"
     actor_signal: "你使用"
-    action: "击倒"
+    action: "擊倒"
+    match_strategy: exact
 
-  # === 队友被击杀（require_signal 优先级最高） ===
+  # === 隊友被擊殺 ===
   - id: teammate_killed_headshot
-    actor: "敌人"
-    actor_signal: "你的队友"
+    actor: "敵人"
+    actor_signal: "你的隊友"
     require_signal: "被"
-    action: "击倒"
-    descriptors_override: ["命中头部"]
+    action: "擊倒"
+    descriptors_override: ["命中頭部"]
     require_descriptor: true
     match_strategy: fuzzy
     similarity_threshold: 0.80
 
   - id: teammate_killed
-    actor: "敌人"
-    actor_signal: "你的队友"
+    actor: "敵人"
+    actor_signal: "你的隊友"
     require_signal: "被"
     action: "淘汰"
     match_strategy: fuzzy
     similarity_threshold: 0.80
 
   - id: teammate_knocked
-    actor: "敌人"
-    actor_signal: "你的队友"
+    actor: "敵人"
+    actor_signal: "你的隊友"
     require_signal: "被"
-    action: "击倒"
+    action: "擊倒"
     match_strategy: fuzzy
     similarity_threshold: 0.80
 
-  # === 自己载具击杀 ===
+  # === 自己載具擊殺 ===
   - id: kill_self_vehicle
     actor: "自己"
     actor_signal: "你引爆"
     action: "淘汰"
+    match_strategy: exact
 
   - id: knockdown_self_vehicle
     actor: "自己"
     actor_signal: "你引爆"
-    action: "击倒"
+    action: "擊倒"
+    match_strategy: exact
 
   # === 自己被淘汰 ===
   - id: killed_self
-    actor: "敌人"
-    actor_signal: "你被"
+    actor: "敵人"
+    actor_signal: "你"
+    require_signal: "被"
     action: "淘汰"
     match_strategy: fuzzy
     similarity_threshold: 0.80
 
   - id: knocked_self
-    actor: "敌人"
-    actor_signal: "你被"
-    action: "击倒"
+    actor: "敵人"
+    actor_signal: "你"
+    require_signal: "被"
+    action: "擊倒"
     match_strategy: fuzzy
     similarity_threshold: 0.80
 
-  # === 队友击杀（anti_signal 排除"被"） ===
+  # === 隊友擊殺 ===
   - id: kill_teammate
-    actor: "队友"
-    actor_signal: "你的队友"
+    actor: "隊友"
+    actor_signal: "你的隊友"
     anti_signal: "被"
     action: "淘汰"
+    match_strategy: exact
 
   - id: knockdown_teammate
-    actor: "队友"
-    actor_signal: "你的队友"
+    actor: "隊友"
+    actor_signal: "你的隊友"
     anti_signal: "被"
-    action: "击倒"
+    action: "擊倒"
+    match_strategy: exact

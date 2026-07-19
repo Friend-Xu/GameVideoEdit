@@ -1,5 +1,6 @@
 # PUBG Mobile — English killfeed detection preset
 meta:
+  platform: "mobile"
   name: "PUBG Mobile English"
   game: "PUBG Mobile"
   language: "en"
@@ -18,12 +19,14 @@ rules:
   - id: kill_self
     actor: "自己"
     actor_signal: "You"
+    anti_signal: "were"
     action: "killed"
     match_strategy: exact
 
   - id: knockdown_self
     actor: "自己"
     actor_signal: "You"
+    anti_signal: "were"
     action: "knocked out"
     match_strategy: exact
 

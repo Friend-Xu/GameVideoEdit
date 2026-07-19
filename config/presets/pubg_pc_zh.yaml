@@ -1,0 +1,140 @@
+# PUBG PC / 绝地求生 — 电脑版中文击杀检测预设
+# PC 版与手机版格式不同:
+#   - 手机版: "你使用[武器]淘汰了[玩家]"  (有"使用")
+#   - PC版:   "你 用 [武器] 淘汰了 [玩家]"  (用"用"不是"使用")
+#   - 队友击杀显示队友真实游戏名, 无双"你的队友"前缀
+#
+# 需要两个 ROI:
+#   ROI-1 "个人击杀": 屏幕中下方, 你自己击杀/被击杀的提示
+#   ROI-2 "队友击杀": 武器栏上方, 队友击杀/被击杀的提示 (需配合玩家名匹配)
+#
+# 当前版本: 个人击杀部分 (ROI-1) 规则完整
+meta:
+  platform: "pc"
+  name: "PUBG PC 简体中文"
+  game: "PUBG PC"
+  language: "zh_CN"
+  version: "1.0.0-beta"
+
+required_rois:
+  - label: "个人击杀"
+    hint: "屏幕中下方, 你击杀/被击杀的提示文字"
+  - label: "队友击杀"
+    hint: "武器栏上方, 队友击杀/被击杀的提示文字"
+
+descriptors:
+  - "爆头"
+  - "命中头部"
+
+trigger_prefixes:
+  个人击杀:
+    - "你"
+  队友击杀:
+    - "击倒"
+    - "淘汰"
+    - "撞"
+
+rules:
+  # === 自己击杀 (ROI-1: 个人击杀) ===
+  # "你 用 M416 淘汰了 xiaoming"
+  - id: kill_self
+    actor: "自己"
+    actor_signal: "你"
+    require_signal: "用"
+    anti_signal: "被"
+    action: "淘汰"
+    match_strategy: exact
+
+  # "你 用 M416 击倒了 xiaoming"
+  - id: knockdown_self
+    actor: "自己"
+    actor_signal: "你"
+    require_signal: "用"
+    anti_signal: "被"
+    action: "击倒"
+    match_strategy: exact
+
+  # === 自己载具击杀 ===
+  - id: kill_self_vehicle
+    actor: "自己"
+    actor_signal: "你"
+    require_signal: "引爆"
+    anti_signal: "被"
+    action: "淘汰"
+    match_strategy: exact
+
+  - id: knockdown_self_vehicle
+    actor: "自己"
+    actor_signal: "你"
+    require_signal: "引爆"
+    anti_signal: "被"
+    action: "击倒"
+    match_strategy: exact
+
+  # === 载具撞击 ===
+  # "3minutecookie驾驶载具撞了你" → 被敌人载具撞
+  - id: hit_by_vehicle
+    actor: "敌人"
+    actor_signal: ""
+    action: "撞了你"
+    match_strategy: exact
+
+  # "你驾驶载具撞了3minutecookie" → 自己撞别人
+  - id: hit_enemy_vehicle
+    actor: "自己"
+    actor_signal: "你"
+    require_signal: "驾驶载具"
+    anti_signal: "撞了你"
+    action: "撞"
+    match_strategy: exact
+
+  # "X驾驶载具撞了Y" → 队友击杀ROI (队友撞人或被撞)
+  - id: teammate_vehicle_pc
+    actor: "队友"
+    actor_signal: ""
+    action: "撞了"
+    match_strategy: exact
+
+  # "X驾驶载具撞了你" → 队友击杀ROI (第三人称自己被撞)
+  - id: hit_by_vehicle_teammate
+    actor: "敌人"
+    actor_signal: ""
+    action: "撞了你"
+    match_strategy: exact
+
+  # === 自己被淘汰 (ROI-1: 个人击杀) ===
+  # "你被 xiaoming 用 M416 淘汰了"
+  - id: killed_self
+    actor: "敌人"
+    actor_signal: "你"
+    require_signal: "被"
+    action: "淘汰"
+    match_strategy: fuzzy
+    similarity_threshold: 0.80
+
+  # "你被 xiaoming 用 M416 击倒了"
+  - id: knocked_self
+    actor: "敌人"
+    actor_signal: "你"
+    require_signal: "被"
+    action: "击倒"
+    match_strategy: fuzzy
+    similarity_threshold: 0.80
+
+  # === 队友击杀/被击杀 (ROI-2: 队友击杀) ===
+  # 格式: "[PlayerA]击倒了[PlayerB]" 或 "PlayerA击倒了PlayerB"
+  # PC 无 "你的队友" 前缀，通过 ROI 位置区分。
+  # 当前无法区分队友击杀敌人 vs 敌人击杀队友，统一标记为"队友"相关事件。
+  - id: teammate_knock_pc
+    actor: "队友"
+    actor_signal: ""
+    anti_signal: "你"
+    action: "击倒"
+    match_strategy: exact
+
+  - id: teammate_kill_pc
+    actor: "队友"
+    actor_signal: ""
+    anti_signal: "你"
+    action: "淘汰"
+    match_strategy: exact

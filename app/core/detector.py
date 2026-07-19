@@ -872,6 +872,7 @@ class DetectionEngine:
             else:
                 roi_img = frame[roi['y']:roi['y'] + roi['h'], roi['x']:roi['x'] + roi['w']]
                 label = roi.get('label', '击杀信息')
+            self._matcher.set_roi(label)
             roi_id = self._roi_id(roi, i)
             if label == '淘汰计数':
                 for ocr_r in self._detector.detect(roi_img):
@@ -968,6 +969,7 @@ class DetectionEngine:
                 label = getattr(roi, 'label', '击杀信息')
             else:
                 label = roi.get('label', '击杀信息')
+            self._matcher.set_roi(label)
             roi_id = self._roi_id(roi, 0)
             if label == '淘汰计数':
                 if not process_counter:
@@ -1434,6 +1436,7 @@ class GPUWorker(threading.Thread):
             for roi_idx, (roi_img, roi) in enumerate(prepped_rois):
                 label = (getattr(roi, 'label', '') if hasattr(roi, 'label')
                          else roi.get('label', ''))
+                self._matcher.set_roi(label)
                 if label == '击杀信息':
                     if not self._detector.has_text(roi_img):
                         if self._logger:
@@ -1451,6 +1454,7 @@ class GPUWorker(threading.Thread):
         for roi_idx, (roi_img, roi) in enumerate(prepped_rois):
             label = (getattr(roi, 'label', '') if hasattr(roi, 'label')
                      else roi.get('label', ''))
+            self._matcher.set_roi(label)
             if label == '淘汰计数':
                 for ocr_r in self._detector.detect_raw(roi_img):
                     old_count = self._counter._count
@@ -1736,13 +1740,14 @@ class DetectionPipeline:
                 precise.sort(key=lambda r: r.start_sec)
                 results = []
                 for r in precise:
-                    if not results:
-                        results.append(r)
-                    elif (r.start_sec - results[-1].end_sec <= self.merge_gap
-                          and r.action == results[-1].action
-                          and r.actor == results[-1].actor):
-                        results[-1].end_sec = max(results[-1].end_sec, r.end_sec)
-                    else:
+                    merged = False
+                    for i in range(len(results) - 1, -1, -1):
+                        if results[i].action == r.action and results[i].actor == r.actor:
+                            if r.start_sec - results[i].end_sec <= self.merge_gap:
+                                results[i].end_sec = max(results[i].end_sec, r.end_sec)
+                                merged = True
+                            break
+                    if not merged:
                         results.append(r)
                 _log.info("细胞分裂(gap): padding+合并后 %d 个片段", len(results))
                 if detected_cb:

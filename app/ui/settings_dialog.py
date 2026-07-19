@@ -23,12 +23,18 @@ class SettingsDialog(QDialog):
     preset_changed = Signal(str)
 
     def __init__(self, detection: DetectionConfig, dark: bool = False,
-                 parent=None, matcher=None, preset_callback=None):
+                 parent=None, matcher=None, preset_callback=None,
+                 platform: str = "mobile", active_preset: str = ""):
         super().__init__(parent)
         self._detection = detection
         self._dark = dark
         self._matcher = matcher
         self._preset_callback = preset_callback
+        self._platform = platform
+        self._active_preset = active_preset
+        self._loaded_preset_file = ""
+        self._player_name = ""
+        self._teammate_names = ""
         self._rules_modified = False
         self._initial = self._snapshot()
         self.setWindowTitle("设置")
@@ -161,6 +167,26 @@ class SettingsDialog(QDialog):
         btn_export.clicked.connect(self._export_preset)
         preset_row.addWidget(btn_export)
         ly.addLayout(preset_row)
+
+        # PC 模式: 玩家名 & 队友名输入
+        self._pc_name_group = QWidget()
+        pc_name_layout = QVBoxLayout(self._pc_name_group)
+        pc_name_layout.setContentsMargins(0, 8, 0, 0)
+        pc_name_layout.setSpacing(6)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("玩家名:"))
+        self._player_name_edit = QLineEdit()
+        self._player_name_edit.setPlaceholderText("输入游戏内昵称")
+        name_row.addWidget(self._player_name_edit, 1)
+        pc_name_layout.addLayout(name_row)
+        tm_row = QHBoxLayout()
+        tm_row.addWidget(QLabel("队友名:"))
+        self._teammate_edit = QLineEdit()
+        self._teammate_edit.setPlaceholderText("逗号分隔多个队友名 (可选)")
+        tm_row.addWidget(self._teammate_edit, 1)
+        pc_name_layout.addLayout(tm_row)
+        self._pc_name_group.setVisible(self._platform == "pc")
+        ly.addWidget(self._pc_name_group)
         ly.addSpacing(12)
 
         # 规则列表（可滚动）
@@ -223,13 +249,20 @@ class SettingsDialog(QDialog):
         pm = PresetManager()
         self._preset_combo.blockSignals(True)
         self._preset_combo.clear()
-        presets = pm.list()
+        presets = pm.list(self._platform)
         for p in presets:
             self._preset_combo.addItem(
                 f"{p['name']} ({p['game']}, {p['language']})", p["file"])
         # Also show current custom config
         self._preset_combo.insertItem(0, "（当前配置）", None)
         self._preset_combo.setCurrentIndex(0)
+        # 选中当前激活的预设
+        if self._active_preset:
+            for i in range(self._preset_combo.count()):
+                if self._preset_combo.itemData(i) == self._active_preset:
+                    self._preset_combo.setCurrentIndex(i)
+                    self._loaded_preset_file = self._active_preset
+                    break
         self._preset_combo.blockSignals(False)
         self._refresh_rule_list()
 
@@ -257,12 +290,14 @@ class SettingsDialog(QDialog):
         file_name = self._preset_combo.itemData(idx)
         if not file_name:
             self._rule_list.clear()
+            self._loaded_preset_file = ""
             return
         from app.core.presets import PresetManager
         from app.core.keywords import KeywordMatcher
         pm = PresetManager()
         config = pm.load(file_name.replace(".yaml", ""))
         self._matcher = KeywordMatcher.from_dict(config)
+        self._loaded_preset_file = file_name
         self._refresh_rule_list()
 
     def _on_rule_selected(self, row: int):
@@ -462,15 +497,6 @@ class SettingsDialog(QDialog):
         form.addRow("合并间隔", self._merge_gap)
 
         # ── 后处理参数 ──
-        self._refine_combo = QComboBox()
-        self._refine_combo.addItem("开", True)
-        self._refine_combo.addItem("关", False)
-        self._refine_combo.setToolTip("二分搜索精化每个事件的起止边界至 ±1 帧")
-        self._refine_combo.currentIndexChanged.connect(
-            lambda i: setattr(self._detection, 'refine_boundaries',
-                              self._refine_combo.itemData(i)))
-        form.addRow("边界精化", self._refine_combo)
-
         self._refine_window = QDoubleSpinBox()
         self._refine_window.setRange(0.5, 5.0)
         self._refine_window.setSingleStep(0.5)
@@ -596,10 +622,6 @@ class SettingsDialog(QDialog):
         self._merge_gap.blockSignals(False)
 
         # 后处理控件
-        self._refine_combo.blockSignals(True)
-        self._refine_combo.setCurrentIndex(0 if d.refine_boundaries else 1)
-        self._refine_combo.blockSignals(False)
-
         self._refine_window.blockSignals(True)
         self._refine_window.setValue(d.refine_search_window)
         self._refine_window.blockSignals(False)
@@ -629,7 +651,8 @@ class SettingsDialog(QDialog):
         config = self._matcher.to_dict()
         pm.save("current_rules", config)
         if self._preset_callback:
-            self._preset_callback(self._matcher.to_dict())
+            pf = self._loaded_preset_file if not self._rules_modified else ""
+            self._preset_callback(self._matcher.to_dict(), pf)
 
     def _reset_defaults(self):
         path = config_dir() / "default.yaml"

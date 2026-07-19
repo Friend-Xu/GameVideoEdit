@@ -1,0 +1,61 @@
+# PUBG PC — English killfeed detection preset
+# PC version format differs from Mobile:
+#   - Personal kill message center-bottom: "You killed [name] with [weapon]"
+#   - Teammate kills show actual teammate name, no "Your teammate" prefix
+#
+# Requires two ROIs:
+#   ROI-1 "个人击杀" (Personal Kill): center-bottom, your own kills/deaths
+#   ROI-2 "队友击杀" (Teammate Kill): above weapon bar, teammate kills/deaths
+meta:
+  platform: "pc"
+  name: "PUBG PC English"
+  game: "PUBG PC"
+  language: "en"
+  version: "1.0.0-beta"
+
+required_rois:
+  - label: "个人击杀"
+    hint: "Center-bottom of screen, your personal kill/death messages"
+  - label: "队友击杀"
+    hint: "Above weapon HUD bar, teammate kill/death messages"
+
+descriptors:
+  - "headshot"
+
+trigger_prefixes:
+  - "You"
+
+rules:
+  # === Self kill (ROI-1: personal) ===
+  # "You killed xiaoming with M416"
+  - id: kill_self
+    actor: "自己"
+    actor_signal: "You"
+    anti_signal: "were"
+    action: "killed"
+    match_strategy: exact
+
+  # "You knocked out xiaoming with M416"
+  - id: knockdown_self
+    actor: "自己"
+    actor_signal: "You"
+    anti_signal: "were"
+    action: "knocked out"
+    match_strategy: exact
+
+  # === Self killed (ROI-1: personal) ===
+  # "You were killed by xiaoming with M416"
+  - id: killed_self
+    actor: "敌人"
+    actor_signal: "You were"
+    action: "killed"
+    match_strategy: fuzzy
+    similarity_threshold: 0.85
+
+  # "You were knocked out by xiaoming with M416"
+  - id: knocked_self
+    actor: "敌人"
+    actor_signal: "You were"
+    action: "knocked out"
+    match_strategy: fuzzy
+    similarity_threshold: 0.85

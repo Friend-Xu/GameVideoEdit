@@ -29,8 +29,10 @@ class KeywordMatcher:
     def __init__(self):
         self._patterns: list[tuple[re.Pattern, dict]] = []
         self._trigger_prefixes: list[str] = []
+        self._roi_prefixes: dict[str, list[str]] = {}  # ROI label → prefix list
         self._rules_config: list[dict] = []
         self._descriptors: list[str] = []
+        self._current_roi: str = ""
 
     # ── 构造入口 ──
 
@@ -59,7 +61,17 @@ class KeywordMatcher:
         else:
             self._load_rules(rules, descriptors)
 
-        self._trigger_prefixes = config.get("trigger_prefixes", [])
+        self._trigger_prefixes = []
+        self._roi_prefixes = {}
+        raw_prefixes = config.get("trigger_prefixes", [])
+        if isinstance(raw_prefixes, dict):
+            self._roi_prefixes = {k: list(v) for k, v in raw_prefixes.items()}
+            # _default key or first ROI's prefixes as fallback
+            self._trigger_prefixes = self._roi_prefixes.get("_default",
+                list(self._roi_prefixes.values())[0] if self._roi_prefixes else [])
+        else:
+            self._trigger_prefixes = list(raw_prefixes)
+            # 兼容：手机模式所有 ROI 共享同一个 prefix 列表
 
     def to_dict(self) -> dict:
         """导出当前规则为 dict（用于保存预设）。"""
@@ -93,6 +105,8 @@ class KeywordMatcher:
                 priority = 2
             elif not rule.get("anti_signal"):
                 priority = 1
+            if rule.get("match_strategy", "exact") == "fuzzy":
+                priority -= 1  # fuzzy 永远低于同级别 exact
             entries.append((priority, regex, {
                 "id": rule["id"],
                 "action": rule.get("action", ""),
@@ -100,6 +114,8 @@ class KeywordMatcher:
                 "anti_signal": rule.get("anti_signal"),
                 "strategy": rule.get("match_strategy", "exact"),
                 "threshold": rule.get("similarity_threshold", 0.85),
+                "require_descriptor": rule.get("require_descriptor", False),
+                "_descriptors": descs,
                 "_signals": self._collect_signals(rule),
             }))
         entries.sort(key=lambda e: e[0], reverse=True)
@@ -122,19 +138,31 @@ class KeywordMatcher:
         if descriptors:
             descs = "(" + "|".join(descriptors) + ")"
             desc_part = descs if rule.get("require_descriptor") else descs + "?"
-        if rule.get("require_signal"):
-            rs = rule["require_signal"]
-            pat = actor + r".+?" + rs + r".*?" + desc_part + r".*?" + action + r"了?"
+        if actor:
+            if rule.get("require_signal"):
+                rs = rule["require_signal"]
+                pat = actor + r".*?" + rs + r".*?" + desc_part + r".*?" + action + r"了?"
+            else:
+                pat = actor + r".*?" + desc_part + r".*?" + action + r"了?"
         else:
-            pat = actor + r".+?" + desc_part + r".*?" + action + r"了?"
+            # 无 actor_signal：匹配任意文字 + action（用于队友击杀等名称匹配场景）
+            pat = r".*" + desc_part + r".*" + action + r"了?"
         return re.compile(pat)
 
     # ── 匹配 ──
 
-    def match(self, text: str) -> MatchResult | None:
+    def set_roi(self, roi_label: str):
+        self._current_roi = roi_label
+
+    def _prefixes_for(self, roi_label: str) -> list[str]:
+        label = roi_label or self._current_roi
+        return self._roi_prefixes.get(label, self._trigger_prefixes)
+
+    def match(self, text: str, roi_label: str = "") -> MatchResult | None:
         if not text or not text.strip():
             return None
-        if self._trigger_prefixes and not any(p in text for p in self._trigger_prefixes):
+        prefixes = self._prefixes_for(roi_label)
+        if prefixes and not any(p in text for p in prefixes):
             return None
         for regex, meta in self._patterns:
             if meta.get("anti_signal") and meta["anti_signal"] in text:
@@ -158,13 +186,15 @@ class KeywordMatcher:
         )
 
     def _fuzzy_match(self, text: str, _regex: re.Pattern, meta: dict) -> MatchResult | None:
-        """Fuzzy 策略：每个信号词独立 partial_ratio，取平均值。
-
-        单一路径，不先试 regex 再降级。
-        """
+        """Fuzzy 策略：每个信号词独立 partial_ratio，取平均值。"""
         signals = meta.get("_signals", [])
         if not signals:
             return None
+        # 描述词必选检查
+        if meta.get("require_descriptor"):
+            descs = meta.get("_descriptors", [])
+            if descs and not any(d in text for d in descs):
+                return None
         try:
             from rapidfuzz import fuzz
         except ImportError:
@@ -182,5 +212,6 @@ class KeywordMatcher:
             confidence=round(score, 4), strategy="fuzzy",
         )
 
-    def has_trigger_prefix(self, text: str) -> bool:
-        return any(p in text for p in self._trigger_prefixes)
+    def has_trigger_prefix(self, text: str, roi_label: str = "") -> bool:
+        prefixes = self._prefixes_for(roi_label)
+        return any(p in text for p in prefixes)

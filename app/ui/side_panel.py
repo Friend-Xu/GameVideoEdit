@@ -23,12 +23,15 @@ class SidePanelWidget(QWidget):
     tag_selected = Signal(int)
     label_colors_changed = Signal(dict)
     history_opened = Signal(str)
+    label_changed = Signal(str)
 
     DEFAULT_LABELS = ["击杀信息", "淘汰计数"]
+    PC_LABELS = ["个人击杀", "队友击杀"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._project: Project | None = None
+        self._platform: str = "mobile"
         self._label_types = list(self.DEFAULT_LABELS)
         self._label_colors = self._gen_colors()
         self._current_label = self._label_types[0]
@@ -39,12 +42,31 @@ class SidePanelWidget(QWidget):
     def set_project(self, project: Project):
         self._project = project
 
+    def on_platform_changed(self, platform: str):
+        """纯 UI 刷新：标签下拉 + 模板列表。不操作 Project 数据。"""
+        if self._platform == platform:
+            return
+        self._platform = platform
+        labels = self.PC_LABELS if platform == "pc" else self.DEFAULT_LABELS
+        self._label_types = list(labels)
+        self._current_label = self._label_types[0]
+        self._type_combo.blockSignals(True)
+        self._type_combo.clear()
+        self._type_combo.addItems(self._label_types)
+        self._type_combo.blockSignals(False)
+        self.refresh_template_list()
+        self.label_changed.emit(self._current_label)
+
     def label_colors(self) -> dict:
         return dict(self._label_colors)
 
     @property
     def current_label(self) -> str:
         return self._current_label
+
+    def _on_label_changed(self, label: str):
+        self._current_label = label
+        self.label_changed.emit(label)
 
     # ---- UI ----
 
@@ -60,8 +82,7 @@ class SidePanelWidget(QWidget):
         tl.addWidget(QLabel("标签类型:"))
         self._type_combo = QComboBox()
         self._type_combo.addItems(self._label_types)
-        self._type_combo.currentTextChanged.connect(
-            lambda t: setattr(self, '_current_label', t))
+        self._type_combo.currentTextChanged.connect(self._on_label_changed)
         tl.addWidget(self._type_combo, 1)
         gl.addLayout(tl)
         self._tag_list = QListWidget()
@@ -199,8 +220,8 @@ class SidePanelWidget(QWidget):
 
     def refresh_template_list(self):
         self._tpl_list.clear()
-        default = self._tpl_mgr.default_name
-        for name in self._tpl_mgr.list_names():
+        default = self._tpl_mgr._default_for(self._platform)
+        for name in self._tpl_mgr.list_names(self._platform):
             prefix = "★ " if name == default else "  "
             item = QListWidgetItem(f"{prefix}{name}")
             self._tpl_list.addItem(item)
@@ -237,7 +258,7 @@ class SidePanelWidget(QWidget):
             })
         name, ok = QInputDialog.getText(self, "保存模板", "模板名称:")
         if ok and name:
-            self._tpl_mgr.save(name, regions)
+            self._tpl_mgr.save(name, regions, platform=self._platform)
             self.refresh_template_list()
 
     def _set_default_template(self):
@@ -246,7 +267,7 @@ class SidePanelWidget(QWidget):
             QMessageBox.information(self, "提示", "请先选中一个模板")
             return
         name = items[0].text().lstrip("★ ")
-        self._tpl_mgr.set_default(name)
+        self._tpl_mgr.set_default(name, platform=self._platform)
         self.refresh_template_list()
 
     def _delete_template(self):

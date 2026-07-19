@@ -1,5 +1,6 @@
 # PUBG Mobile / 和平精英 — 简体中文击杀检测预设
 meta:
+  platform: "mobile"
   name: "PUBG Mobile 简体中文"
   game: "PUBG Mobile"
   language: "zh_CN"
@@ -73,14 +74,16 @@ rules:
   # === 自己被淘汰 ===
   - id: killed_self
     actor: "敌人"
-    actor_signal: "你被"
+    actor_signal: "你"
+    require_signal: "被"
     action: "淘汰"
     match_strategy: fuzzy
     similarity_threshold: 0.80
 
   - id: knocked_self
     actor: "敌人"
-    actor_signal: "你被"
+    actor_signal: "你"
+    require_signal: "被"
     action: "击倒"
     match_strategy: fuzzy
     similarity_threshold: 0.80

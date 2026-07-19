@@ -1,16 +1,9 @@
 {
-  "default": "Ipad",
+  "default": {
+    "mobile": "Ipad",
+    "pc": "PUBG_PC端"
+  },
   "templates": {
-    "iphone": [
-      {
-        "id": 1,
-        "label": "击杀信息",
-        "center_x": 0.532292,
-        "center_y": 0.666667,
-        "width": 0.58125,
-        "height": 0.125
-      }
-    ],
     "Ipad": [
       {
         "id": 2,
@@ -28,6 +21,27 @@
         "width": 0.567708,
         "height": 0.044228
       }
-    ]
+    ],
+    "PUBG_PC端": {
+      "platform": "pc",
+      "regions": [
+        {
+          "id": 5,
+          "label": "个人击杀",
+          "center_x": 0.505469,
+          "center_y": 0.685069,
+          "width": 0.389844,
+          "height": 0.036806
+        },
+        {
+          "id": 10,
+          "label": "队友击杀",
+          "center_x": 0.507227,
+          "center_y": 0.824653,
+          "width": 0.391016,
+          "height": 0.034028
+        }
+      ]
+    }
   }
 }

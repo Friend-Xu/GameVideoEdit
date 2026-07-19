@@ -14,6 +14,7 @@ from app.utils.paths import config_dir
 class ROITemplate:
     name: str
     regions: list[dict] = field(default_factory=list)
+    platform: str = "mobile"
 
 
 class ROITemplateManager:
@@ -30,6 +31,21 @@ class ROITemplateManager:
     @property
     def _path(self) -> Path:
         return config_dir() / "roi_templates.json"
+
+    @staticmethod
+    def _unwrap(entry) -> list[dict]:
+        """兼容旧格式 (bare list) 和新格式 ({platform, regions})。"""
+        if isinstance(entry, list):
+            return entry
+        if isinstance(entry, dict):
+            return entry.get("regions", [])
+        return []
+
+    @staticmethod
+    def _platform_of(entry) -> str:
+        if isinstance(entry, dict) and "platform" in entry:
+            return entry["platform"]
+        return "mobile"
 
     def _load(self) -> dict:
         if self._loaded:
@@ -55,17 +71,27 @@ class ROITemplateManager:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self._data, f, ensure_ascii=False, indent=2)
 
-    def list_names(self) -> list[str]:
-        return list(self._load()["templates"].keys())
+    def list_names(self, platform: str | None = None) -> list[str]:
+        result = []
+        templates = self._load()["templates"]
+        for name, entry in templates.items():
+            if platform is None or self._platform_of(entry) == platform:
+                result.append(name)
+        return result
 
     def get(self, name: str) -> ROITemplate | None:
-        regions = self._load()["templates"].get(name)
-        if regions is None:
+        entry = self._load()["templates"].get(name)
+        if entry is None:
             return None
-        return ROITemplate(name=name, regions=list(regions))
+        regions = self._unwrap(entry)
+        platform = self._platform_of(entry)
+        return ROITemplate(name=name, regions=list(regions), platform=platform)
 
-    def save(self, name: str, regions: list[dict]):
-        self._load()["templates"][name] = regions
+    def save(self, name: str, regions: list[dict], platform: str = "mobile"):
+        self._load()["templates"][name] = {
+            "platform": platform,
+            "regions": regions,
+        }
         self._save()
 
     def delete(self, name: str) -> bool:
@@ -80,16 +106,35 @@ class ROITemplateManager:
 
     @property
     def default_name(self) -> str:
-        return self._load().get("default", "")
+        d = self._load().get("default", "")
+        if isinstance(d, str):
+            return d
+        return d.get("mobile", "") if isinstance(d, dict) else ""
 
-    def set_default(self, name: str):
+    def _default_for(self, platform: str) -> str:
+        d = self._load().get("default", "")
+        if isinstance(d, str):
+            return d if platform == "mobile" else ""
+        return d.get(platform, "") if isinstance(d, dict) else ""
+
+    def set_default(self, name: str, platform: str = "mobile"):
         if name and name not in self._load()["templates"]:
             return
-        self._load()["default"] = name
+        d = self._load().get("default", "")
+        if not isinstance(d, dict):
+            d = {}
+        d[platform] = name
+        self._load()["default"] = d
         self._save()
 
     def get_default(self) -> ROITemplate | None:
         name = self.default_name
+        if not name:
+            return None
+        return self.get(name)
+
+    def get_default_for(self, platform: str) -> ROITemplate | None:
+        name = self._default_for(platform)
         if not name:
             return None
         return self.get(name)

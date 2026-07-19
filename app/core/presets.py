@@ -23,20 +23,24 @@ class PresetManager:
         self._dir = Path(presets_dir) if presets_dir else PRESETS_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
 
-    def list(self) -> list[dict]:
-        """列出所有预设的元信息。"""
+    def list(self, platform: str | None = None) -> list[dict]:
+        """列出所有预设的元信息。platform 为 None 时返回全部。"""
         result = []
         for f in sorted(self._dir.glob("*.yaml")):
             try:
                 with open(f, "r", encoding="utf-8") as fp:
                     config = yaml.safe_load(fp) or {}
                 meta = config.get("meta", {})
+                pf = meta.get("platform", "mobile")
+                if platform is not None and pf != platform:
+                    continue
                 result.append({
                     "name": meta.get("name", f.stem),
                     "game": meta.get("game", ""),
                     "language": meta.get("language", ""),
                     "version": meta.get("version", ""),
                     "file": f.name,
+                    "platform": pf,
                     "rule_count": len(config.get("rules", [])),
                 })
             except Exception:
