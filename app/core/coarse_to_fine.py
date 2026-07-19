@@ -279,6 +279,8 @@ class DenseScanner:
                     pattern_id=frame_matched.pattern_id,
                     raw_text=frame_matched.raw_text,
                     source="text",
+                    confidence=frame_matched.confidence,
+                    match_strategy=frame_matched.strategy,
                 ))
                 if detected_cb:
                     detected_cb(timestamp, frame_matched.raw_text)
@@ -381,6 +383,8 @@ class BoundaryRefiner:
             action=result.action, actor=result.actor,
             pattern_id=result.pattern_id, match_count=result.match_count,
             source=result.source,
+            raw_text=result.raw_text,
+            confidence=result.confidence, match_strategy=result.match_strategy,
         )
 
     def _binary_search_boundary(self, player: VideoPlayer, kill_roi, fps: float,
@@ -555,6 +559,7 @@ def gap_binary_search(video_path: str, pixel_rois: list, kill_roi_index: int,
                 actor=hit.get('actor', ''),
                 pattern_id=hit.get('pattern_id', ''),
                 source="text",
+                raw_text=hit.get('ocr_text', ''),
             ))
 
             if progress_cb:
@@ -658,6 +663,9 @@ def binseg_event_search(video_path: str, pixel_rois: list, kill_roi_index: int,
                     raw_start_sec=new_start, raw_end_sec=new_end,
                     action=match.action, actor=match.actor,
                     pattern_id=match.pattern_id, source="text",
+                    raw_text=match.raw_text,
+                    confidence=match.confidence,
+                    match_strategy=match.strategy,
                 ))
 
                 # 递归左侧 (不传 progress_cb，避免进度条回跳)

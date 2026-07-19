@@ -58,6 +58,9 @@ class DetectionResult(TimeRange):
     source: str = "text"  # "text", "counter", "both"
     raw_start_sec: float = 0.0
     raw_end_sec: float = 0.0
+    raw_text: str = ""
+    confidence: float = 1.0
+    match_strategy: str = "exact"
 
 
 @dataclass
@@ -69,6 +72,8 @@ class SignalEvent:
     pattern_id: str = ""
     raw_text: str = ""
     source: str = "text"  # "text" or "counter"
+    confidence: float = 1.0
+    match_strategy: str = "exact"
 
 
 @dataclass
@@ -414,6 +419,8 @@ class EventStackEngine:
             src = "counter"
         else:
             src = "text"
+        min_conf = min(e.confidence for e in events)
+        is_fuzzy = any(e.match_strategy == "fuzzy" for e in events)
         self._results.append(DetectionResult(
             start_sec=max(0.0, events[0].timestamp - self._cfg.padding_before),
             end_sec=events[-1].timestamp + self._cfg.padding_after,
@@ -421,6 +428,9 @@ class EventStackEngine:
             raw_end_sec=events[-1].timestamp,
             action=key[0], actor=key[1], pattern_id=events[0].pattern_id,
             match_count=len(events), source=src,
+            confidence=min_conf,
+            match_strategy="fuzzy" if is_fuzzy else "exact",
+            raw_text=events[0].raw_text,
         ))
 
 
@@ -1140,6 +1150,8 @@ class DetectionEngine:
                             pattern_id=frame_matched.pattern_id,
                             raw_text=frame_matched.raw_text,
                             source="text",
+                            confidence=frame_matched.confidence,
+                            match_strategy=frame_matched.strategy,
                         ))
                         if detected_cb:
                             detected_cb(timestamp, frame_matched.raw_text)
@@ -1185,6 +1197,8 @@ class DetectionEngine:
                             pattern_id=frame_matched.pattern_id,
                             raw_text=frame_matched.raw_text,
                             source="text",
+                            confidence=frame_matched.confidence,
+                            match_strategy=frame_matched.strategy,
                         ))
                         if detected_cb:
                             detected_cb(timestamp, frame_matched.raw_text)
@@ -1265,6 +1279,8 @@ class DetectionEngine:
                     pattern_id=last.pattern_id,
                     match_count=last.match_count + r.match_count,
                     source=last.source,
+                    confidence=min(last.confidence, r.confidence),
+                    match_strategy="fuzzy" if last.match_strategy == "fuzzy" or r.match_strategy == "fuzzy" else "exact",
                 )
             else:
                 merged.append(r)
@@ -1673,7 +1689,9 @@ class DetectionPipeline:
                         timestamp=ts, action=matched.action,
                         actor=matched.actor,
                         pattern_id=matched.pattern_id,
-                        raw_text=matched.raw_text, source="text"))
+                        raw_text=matched.raw_text, source="text",
+                        confidence=matched.confidence,
+                        match_strategy=matched.strategy))
                     if detected_cb:
                         detected_cb(ts, matched.raw_text)
                 next_idx += 1

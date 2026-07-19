@@ -502,12 +502,28 @@ class MainWindow(QMainWindow):
         self._log.debug("pipeline 完成: %d 个 time_ranges", len(time_ranges))
         all_clips = []
         for r in time_ranges:
-            all_clips.append(ClipResult(
-                start_sec=r.start_sec, end_sec=r.end_sec,
-                raw_start_sec=getattr(r, 'raw_start_sec', r.start_sec),
-                raw_end_sec=getattr(r, 'raw_end_sec', r.end_sec),
-                action=r.action, actor=r.actor,
-                pattern_id=r.pattern_id, source=r.source))
+            if isinstance(r, tuple):
+                all_clips.append(ClipResult(
+                    start_sec=r[0], end_sec=r[1],
+                    action=r[2] if len(r) > 2 else "",
+                    actor=r[3] if len(r) > 3 else "",
+                    pattern_id=r[4] if len(r) > 4 else "",
+                    source=r[5] if len(r) > 5 else "text",
+                    raw_start_sec=r[6] if len(r) > 6 else 0.0,
+                    raw_end_sec=r[7] if len(r) > 7 else 0.0,
+                    raw_text=r[8] if len(r) > 8 else "",
+                    confidence=r[9] if len(r) > 9 else 1.0,
+                    match_strategy=r[10] if len(r) > 10 else "exact"))
+            else:
+                all_clips.append(ClipResult(
+                    start_sec=r.start_sec, end_sec=r.end_sec,
+                    raw_start_sec=getattr(r, 'raw_start_sec', r.start_sec),
+                    raw_end_sec=getattr(r, 'raw_end_sec', r.end_sec),
+                    action=r.action, actor=r.actor,
+                    pattern_id=r.pattern_id, source=r.source,
+                    raw_text=getattr(r, 'raw_text', ''),
+                    confidence=getattr(r, 'confidence', 1.0),
+                    match_strategy=getattr(r, 'match_strategy', 'exact')))
 
         if all_clips:
             all_clips.sort(key=lambda c: c.start_sec)
@@ -562,7 +578,7 @@ class MainWindow(QMainWindow):
             f"识别中... {done}/{len(self._ocr_threads)} 个线程完成 | 发现 {self._detect_hit_count} 个片段")
 
     def _append_log(self, msg: str, level: int):
-        colors = {0: "#aaa", 1: "#fa0", 2: "#f55"}
+        colors = {0: "#aaa", 1: "#fa0", 2: "#f55", 3: "#4caf50"}
         color = colors.get(level, "#aaa")
         self._log_view.append(f"<span style='color:{color}'>{msg}</span>")
 
@@ -604,13 +620,17 @@ class MainWindow(QMainWindow):
                 start_sec=c.start_sec, end_sec=c.end_sec,
                 raw_start_sec=c.raw_start_sec, raw_end_sec=c.raw_end_sec,
                 action=c.action, actor=c.actor,
-                pattern_id=c.pattern_id, source=c.source)
+                pattern_id=c.pattern_id, source=c.source,
+                raw_text=c.raw_text, confidence=c.confidence,
+                match_strategy=c.match_strategy)
             rr = refiner.refine(r, fps, search_window=search_window)
             refined.append(ClipResult(
                 start_sec=rr.start_sec, end_sec=rr.end_sec,
                 raw_start_sec=rr.raw_start_sec, raw_end_sec=rr.raw_end_sec,
                 action=rr.action, actor=rr.actor,
-                pattern_id=rr.pattern_id, source=rr.source))
+                pattern_id=rr.pattern_id, source=rr.source,
+                raw_text=rr.raw_text, confidence=rr.confidence,
+                match_strategy=rr.match_strategy))
         return refined
 
     def _cell_divide_events(self, clips: list) -> list:
@@ -662,7 +682,9 @@ class MainWindow(QMainWindow):
                         start_sec=se.start_sec, end_sec=se.end_sec,
                         raw_start_sec=se.raw_start_sec, raw_end_sec=se.raw_end_sec,
                         action=se.action, actor=se.actor,
-                        pattern_id=se.pattern_id, source=se.source))
+                        pattern_id=se.pattern_id, source=se.source,
+                        raw_text=se.raw_text, confidence=se.confidence,
+                        match_strategy=se.match_strategy))
             else:
                 all_results.append(c)
         return all_results
@@ -697,10 +719,14 @@ class MainWindow(QMainWindow):
                     src = item[5] if len(item) > 5 else "text"
                     rss = item[6] if len(item) > 6 else 0.0
                     rse = item[7] if len(item) > 7 else 0.0
+                    raw_txt = item[8] if len(item) > 8 else ""
+                    conf = item[9] if len(item) > 9 else 1.0
+                    strat = item[10] if len(item) > 10 else "exact"
                     all_clips.append(ClipResult(
                         start_sec=s, end_sec=e, raw_start_sec=rss, raw_end_sec=rse,
                         action=action, actor=actor,
-                        pattern_id=pid, source=src))
+                        pattern_id=pid, source=src,
+                        raw_text=raw_txt, confidence=conf, match_strategy=strat))
             self._log.debug("构建 %d 个 ClipResult", len(all_clips))
             if self._project.detection.refine_boundaries and all_clips:
                 try:
@@ -755,7 +781,9 @@ class MainWindow(QMainWindow):
         merged.results = [
             {"start_sec": c.start_sec, "end_sec": c.end_sec,
              "action": c.action, "actor": c.actor,
-             "pattern_id": c.pattern_id, "source": c.source}
+             "pattern_id": c.pattern_id, "source": c.source,
+             "raw_text": c.raw_text, "confidence": c.confidence,
+             "match_strategy": c.match_strategy}
             for c in results
         ]
         merged.summary.detections_after_merge = len(results)
@@ -778,7 +806,8 @@ class MainWindow(QMainWindow):
             em, es = int(r.end_sec // 60), int(r.end_sec % 60)
             tag = f"[{r.actor}·{r.action}]" if r.actor else ""
             src_mark = {"both": " ★", "counter": " ○"}.get(r.source, "")
-            text = f"{tag} 片段 {i+1}: [{sm:02d}:{ss:02d} - {em:02d}:{es:02d}] 时长 {r.duration:.1f}秒{src_mark}"
+            conf_tag = f" ~{r.confidence:.0%}" if r.match_strategy == "fuzzy" else ""
+            text = f"{tag} 片段 {i+1}: [{sm:02d}:{ss:02d} - {em:02d}:{es:02d}] 时长 {r.duration:.1f}秒{src_mark}{conf_tag}"
             item = QListWidgetItem(text)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
@@ -805,6 +834,15 @@ class MainWindow(QMainWindow):
         idx = self._result_list.row(item)
         if 0 <= idx < len(self._project.results):
             r = self._project.results[idx]
+            ts = int(r.start_sec)
+            strat = r.match_strategy if r.match_strategy != "exact" else ""
+            ocr = r.raw_text[:40] + "..." if len(r.raw_text) > 40 else r.raw_text
+            self._append_log(
+                "[%02d:%02d] %s:%s %s OCR=\"%s\" conf=%.2f" % (
+                ts // 60, ts % 60, r.action, r.actor,
+                f"[{strat}]" if strat else "",
+                ocr or "(无原文)", r.confidence,
+            ), level=3)
             seek_to = max(0, r.start_sec + self._project.detection.padding_before - 1.5)
             self._player.seek_to_second(seek_to)
 

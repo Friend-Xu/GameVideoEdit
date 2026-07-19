@@ -87,6 +87,8 @@ class ClipResult:
     actor: str = ""
     raw_text: str = ""
     source: str = "text"
+    confidence: float = 1.0
+    match_strategy: str = "exact"
 
     @property
     def duration(self) -> float:
@@ -238,6 +240,8 @@ class Project:
                             action=r.get("action", ""), actor=r.get("actor", ""),
                             raw_text=r.get("raw_text", ""),
                             source=r.get("source", "text"),
+                            confidence=r.get("confidence", 1.0),
+                            match_strategy=r.get("match_strategy", "exact"),
                         ))
                     self.last_detection = data.get("last_detection", "")
                     det = data.get("detection", {})
@@ -390,6 +394,8 @@ class Project:
                     "actor": r.actor,
                     "raw_text": r.raw_text,
                     "source": r.source,
+                    "confidence": r.confidence,
+                    "match_strategy": r.match_strategy,
                 }
                 for r in self.results
             ],
@@ -439,6 +445,8 @@ class Project:
                 action=r.get("action", ""), actor=r.get("actor", ""),
                 raw_text=r.get("raw_text", ""),
                 source=r.get("source", "text"),
+                confidence=r.get("confidence", 1.0),
+                match_strategy=r.get("match_strategy", "exact"),
             ))
         exp = data.get("export", {})
         if exp:

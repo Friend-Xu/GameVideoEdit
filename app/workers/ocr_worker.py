@@ -87,7 +87,8 @@ class OCRWorker(QThread):
                 cancel_check=self._cancel_event.is_set,
             )
             results = [(r.start_sec, r.end_sec, r.action, r.actor, r.pattern_id, r.source,
-                        r.raw_start_sec, r.raw_end_sec)
+                        r.raw_start_sec, r.raw_end_sec,
+                        r.raw_text, r.confidence, r.match_strategy)
                        for r in time_ranges]
             self.finished.emit(tid, results, report)
         except Exception as e:
@@ -209,7 +210,8 @@ class PoolOCRWorker(QThread):
             merged = []
             for r in all_results:
                 rt = (r.start_sec, r.end_sec, r.action, r.actor, r.pattern_id, r.source,
-                      r.raw_start_sec, r.raw_end_sec)
+                      r.raw_start_sec, r.raw_end_sec,
+                      r.raw_text, r.confidence, r.match_strategy)
                 if not merged or merged[-1][:6] != rt[:6]:
                     merged.append(rt)
 
