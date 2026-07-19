@@ -20,16 +20,22 @@ A desktop application that detects kill events in gameplay videos via OCR and ex
 
 | | |
 |---|---|
+| Dual Platform / 双平台 | mobile (PUBG Mobile/和平精英) + PC (PUBG PC) toggle, per-platform state isolation |
+| Language Presets / 语言预设 | 7 presets: zh_CN, zh_TW, en, ja, ko for both platforms, toolbar quick-switch |
 | Video Player / 视频播放器 | frame-by-frame, rotation, drag-and-drop, audio playback / 逐帧、旋转、拖拽、音频播放 |
 | Keyboard Shortcuts / 快捷键 | Space: play/pause, ←→: prev/next frame / 空格: 播放暂停, 方向键: 逐帧 |
 | Timeline / 时间轴 | ruler, clip markers, zoom, playhead drag, click-to-seek / 刻度尺、片段标记、缩放、游标拖拽 |
 | Smart Seek / 智能跳转 | double-click clip → jump 1.5s before trigger / 双击片段精准跳转 |
-| ROI Annotation / 区域标注 | multi-label boxes, template presets / 多标签框选、模板预设 |
-| OCR Detection / 文字识别 | EasyOCR + GPU acceleration, multi-threaded pool / GPU加速、多线程流水线 |
+| ROI Annotation / 区域标注 | multi-label boxes, per-platform default templates / 多标签框选、分平台默认模板 |
+| OCR Detection / 文字识别 | RapidOCR + EasyOCR, GPU acceleration, pool pipeline (CPU/GPU workers) |
+| Keyword Matching / 关键词匹配 | exact + fuzzy matching, vehicle hit events, kill/knockdown/team events |
+| Cell Divide / 细胞分裂 | gap binary search for precise event boundaries / 间隙二分搜索精确事件边界 |
 | Logging System / 日志系统 | file rotation + Qt bridge + crash capture / 文件轮转、GUI桥接、崩溃捕获 |
 | Smart Export / 智能导出 | FFmpeg + NVENC/AMF/QSV hardware encode / GPU硬件编码 |
 
-![screenshot](GUI截图.png)
+![手机模式截图](assets/icons/手机.png)
+
+![PC模式截图](assets/icons/PC.png)
 
 ## Architecture | 架构
 
@@ -46,12 +52,18 @@ app/
 │   ├── annotator.py # Label model / 标注数据模型
 │   ├── keywords.py  # Pattern matching / 关键词匹配
 │   ├── detector.py  # OCR pipeline / OCR流水线
-│   └── exporter.py  # FFmpeg engine / 导出引擎
+│   ├── exporter.py  # FFmpeg engine / 导出引擎
+│   ├── presets.py   # Preset manager / 预设管理
+│   ├── project.py   # Project state (per-platform) / 项目状态
+│   ├── roi_templates.py  # ROI template CRUD / ROI模板
+│   └── coarse_to_fine.py # Boundary refinement / 边界精化
 ├── ui/              # PySide6 GUI
 │   ├── main_window.py  # Main window / 主窗口
 │   ├── video_player.py # Player widget / 播放器
 │   ├── timeline.py     # Timeline widget / 时间轴
 │   ├── overlay.py      # Annotation overlay / 标注层
+│   ├── side_panel.py   # Side panel (tags, templates) / 侧边栏
+│   ├── settings_dialog.py # Settings dialog / 设置对话框
 │   └── log_window.py   # Log viewer / 日志查看器
 ├── utils/           # Utilities / 工具
 │   └── logger.py    # Logging system / 日志系统
@@ -98,7 +110,11 @@ python cli.py info video.mp4
 python cli.py match "你使用 M416 击倒了 玩家"
 python cli.py match -i                    # 交互式测试
 
-# OCR 检测 (使用 ROI 标注文件)
+# OCR 检测 — Pool 模式 (推荐, CPU/GPU 多线程)
+python cli.py detect video.mp4 --pipeline pool --cell-divide \\
+    --config config/presets/pubg_pc_zh.yaml
+
+# OCR 检测 — Legacy 模式
 python cli.py detect video.mp4 --roi video.roi.json -o results.json
 
 # OCR 检测 (手动指定 ROI 区域)
@@ -125,10 +141,17 @@ Edit `config/default.yaml` / 编辑 `config/default.yaml`:
 
 | Key | Default | Description / 说明 |
 |-----|---------|---------------------|
+| `ocr.engine` | rapidocr | OCR engine: easyocr / rapidocr |
 | `ocr.gpu` | true | Enable GPU / 启用GPU加速 |
 | `ocr.confidence_threshold` | 0.5 | Min OCR confidence / 最低置信度 |
-| `detection.padding_before` | 10 | Seconds before kill / 击杀前秒数 |
-| `detection.padding_after` | 10 | Seconds after kill / 击杀后秒数 |
+| `detection.mode` | frame | Detection mode: time / frame |
+| `detection.pipeline_mode` | pool | Pipeline mode: legacy / pool |
+| `detection.padding_before` | 5.0 | Seconds before kill / 击杀前秒数 |
+| `detection.padding_after` | 5.0 | Seconds after kill / 击杀后秒数 |
+| `detection.cell_divide` | true | Gap binary search / 细胞分裂精确边界 |
+| `detection.gate_mode` | neural | Text gate: pixel / neural |
+| `detection.cpu_workers` | 6 | Pool mode CPU threads / CPU线程数 |
+| `detection.gpu_workers` | 4 | Pool mode GPU threads / GPU线程数 |
 | `export.quality` | 23 | CRF/CQ (lower=better / 越低越好) |
 
 ## License | 许可
